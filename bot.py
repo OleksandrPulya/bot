@@ -1,4 +1,7 @@
 import asyncio
+import aiohttp
+import shutil
+from collections import defaultdict, deque
 import html
 import logging
 import os
@@ -22,11 +25,15 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-TOKEN = "9047816471:AAHihHyDrhRhJK324DnPtLmdpdfVF5dgPZU"
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip()
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
 BOT_USERNAME = ""  # заповнюється під час запуску в main()
+FLOOD_WINDOWS = defaultdict(deque)
+SPAM_RECENT = defaultdict(deque)
 
 # ---------------------- ГОЛОСОВІ ПОВІДОМЛЕННЯ (Whisper) ----------------------
 # Потрібно: pip install faster-whisper   (і системний ffmpeg для декодування .ogg)
@@ -114,6 +121,22 @@ CREATE TABLE IF NOT EXISTS autoreply_contacts(
     owner_id INTEGER, chat_id INTEGER, text TEXT, PRIMARY KEY(owner_id, chat_id));
 CREATE TABLE IF NOT EXISTS chat_names(
     owner_id INTEGER, chat_id INTEGER, name TEXT, PRIMARY KEY(owner_id, chat_id));
+CREATE TABLE IF NOT EXISTS contacts(
+    owner_id INTEGER, chat_id INTEGER, user_id INTEGER, username TEXT,
+    full_name TEXT, first_name TEXT, last_name TEXT, updated_at REAL,
+    PRIMARY KEY(owner_id, chat_id));
+CREATE TABLE IF NOT EXISTS event_logs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER,
+    action TEXT, details TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS whitelist(
+    owner_id INTEGER, chat_id INTEGER, PRIMARY KEY(owner_id, chat_id));
+CREATE TABLE IF NOT EXISTS auto_rules(
+    owner_id INTEGER, kind TEXT, value TEXT, enabled INTEGER DEFAULT 1,
+    PRIMARY KEY(owner_id, kind));
+CREATE TABLE IF NOT EXISTS tags(
+    owner_id INTEGER, chat_id INTEGER, tag TEXT, PRIMARY KEY(owner_id, chat_id));
+CREATE TABLE IF NOT EXISTS chat_activity(
+    owner_id INTEGER, chat_id INTEGER, ts REAL, PRIMARY KEY(owner_id, chat_id));
 """)
 db.commit()
 
@@ -143,6 +166,14 @@ ensure_column("scheduled_tasks", "recurrence", "TEXT")
 ensure_column("scheduled_tasks", "weekday", "INTEGER")
 ensure_column("scheduled_tasks", "hhmm", "TEXT")
 ensure_column("stats_log", "chat_id", "INTEGER")
+ensure_column("settings", "antiflood_limit", "INTEGER DEFAULT 0")
+ensure_column("settings", "autotranslate_enabled", "INTEGER DEFAULT 0")
+ensure_column("settings", "autotranslate_lang", "TEXT DEFAULT 'uk'")
+ensure_column("settings", "autonote_keyword", "TEXT DEFAULT ''")
+ensure_column("settings", "antispam_enabled", "INTEGER DEFAULT 0")
+ensure_column("settings", "vip_only", "INTEGER DEFAULT 0")
+ensure_column("settings", "auto_delete_hours", "INTEGER DEFAULT 0")
+ensure_column("settings", "auto_backup_enabled", "INTEGER DEFAULT 0")
 db.commit()
 
 SETTING_TITLES = {
@@ -272,6 +303,13 @@ HELP_PAGES = {
         "<code>!мут</code> / <code>!мут 30м</code> — замутити (назавжди / на час)\n"
         "<code>!анмут</code> — зняти мут\n"
         "<code>!вип</code> / <code>!анвип</code> — додати/зняти VIP (пробиває DND)\n"
+        "<code>!важливий</code> / <code>!анважливий</code> — швидкі псевдоніми VIP\n"
+        "<code>!тількиважливі</code> — перемкнути сповіщення лише від VIP\n"
+        "<code>!тихийрежим 2г</code> — тимчасовий тихий режим\n"
+        "<code>!повтор 10м</code> — повторне сповіщення\n"
+        "<code>!цитата</code> — останнє збережене повідомлення\n"
+        "<code>!очиститиісторію</code> — очистити локальну копію переписки\n"
+        "<code>!автовидалення 24г</code> — термін зберігання копій\n"
         "<code>!ігнор</code> / <code>!деігнор</code> — ігнорувати чат / повернути\n"
         "<code>!нотатка текст</code> — зберегти нотатку\n"
         "<code>!нагадай 18:00 текст</code> — нагадати один раз\n"
@@ -283,7 +321,9 @@ HELP_PAGES = {
         "<code>!ключлише слово</code> — ключове слово лише в цьому чаті\n"
         "<code>!ключвиняток слово</code> — вимкнути ключове слово в цьому чаті\n"
         "<code>!автовідповідь текст</code> / <code>off</code> — автовідповідь "
-        "саме для цього контакту\n\n"
+        "саме для цього контакту\n"
+        "<code>!дозволити</code> / <code>!заборонити</code> — список дозволених контактів\n"
+        "<code>!антиспам</code> — перемкнути антиспам\n\n"
         "🤖 <b>Команди в чаті з ботом</b>\n\n"
         "/start, /help — меню й ця інструкція\n"
         "/settings — налаштування\n"
@@ -299,7 +339,13 @@ HELP_PAGES = {
         "/autoreply текст — автовідповідь (<code>/autoreply off</code> — вимкнути,\n"
         "  <code>/autoreply 09:00-18:00 текст</code> — лише в цей час)\n"
         "/dnd 23:00-08:00 — тихі години (<code>/dnd off</code> — вимкнути)\n"
-        "/cleanup 30 — скільки днів зберігати історію"
+        "/cleanup 30 — скільки днів зберігати історію\n"
+        "/ai запит — запит до OpenAI\n/summarize CHAT_ID — підсумок переписки\n"
+        "/reply CHAT_ID — варіанти відповіді\n/translate CHAT_ID [мова] — переклад\n"
+        "/explain CHAT_ID — пояснення останнього повідомлення\n/sentiment CHAT_ID — тон переписки\n"
+        "/top, /activity, /inactive, /chatstats ID, /deleted, /edited, /report — аналітика\n"
+        "/backup — резервна копія; /backup auto — щотижневі копії; /restore у відповідь на файл — відновлення\n"
+        "/security, /logs, /whitelist, /antiflood 20, /antispam, /viponly, /blocked, /schedule, /daily, /autotranslate on uk, /autonote слово, /autotag слово мітка, /tag ID мітка, /smartsearch запит, /tags, /rules"
     ),
     "privacy": (
         "🔒 <b>Приватність</b>\n\n"
@@ -307,9 +353,12 @@ HELP_PAGES = {
         "повідомлень (зокрема всі версії редагувань), транскрипти голосових "
         "повідомлень, а також твої нотатки, шаблони, ключові слова й "
         "статистику використання у власній базі даних.\n\n"
-        "• Дані зберігаються лише в базі цього бота й нікому не передаються, "
-        "файл бази даних ніколи не надсилається в Telegram — ні тобі, ні "
-        "будь-кому іншому.\n"
+        "• Збережені дані зберігаються в базі цього бота. Файл бази даних "
+        "автоматично нікому не надсилається.\n"
+        "• Коли ти вручну використовуєш /ai, /summarize, /reply, /translate, "
+        "/explain, /sentiment або вмикаєш автопереклад, відповідний текст "
+        "передається до OpenAI API для обробки. Не передавай конфіденційні дані, "
+        "якщо не погоджуєшся на таку обробку.\n"
         "• Відключити бота можна будь-коли: <b>Налаштування → Акаунт → "
         "Автоматизація чатів</b>.\n"
         "• Стару історію бот видаляє сам (/cleanup), а кнопка нижче видаляє "
@@ -377,7 +426,9 @@ def in_dnd(owner_id: int) -> bool:
 
 
 def allowed_now(owner_id: int, chat_id: int) -> bool:
-    """Чи можна надсилати сповіщення власнику зараз (VIP пробиває DND)."""
+    """Перевірка VIP-only та DND. VIP-контакти проходять крізь DND."""
+    if get_setting(owner_id, "vip_only") and not is_vip(owner_id, chat_id):
+        return False
     return is_vip(owner_id, chat_id) or not in_dnd(owner_id)
 
 
@@ -433,6 +484,155 @@ def cache_message(m: Message):
             (owner_id, m.chat.id, m.chat.full_name or str(m.chat.id)),
         )
     db.commit()
+
+
+# ---------------------- ЄДИНА ІДЕНТИФІКАЦІЯ КОНТАКТІВ ----------------------
+def remember_contact(owner_id: int, m: Message):
+    user = m.from_user
+    if not user or user.id == owner_id:
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO contacts(owner_id,chat_id,user_id,username,full_name,first_name,last_name,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (owner_id, m.chat.id, user.id, user.username, user.full_name,
+         user.first_name, user.last_name, time.time()),
+    )
+    db.execute("INSERT OR REPLACE INTO chat_names(owner_id,chat_id,name) VALUES(?,?,?)",
+               (owner_id, m.chat.id, m.chat.full_name or user.full_name or str(m.chat.id)))
+    db.execute("INSERT OR REPLACE INTO chat_activity(owner_id,chat_id,ts) VALUES(?,?,?)",
+               (owner_id, m.chat.id, time.time()))
+    db.commit()
+
+
+def contact_card(owner_id: int, chat_id: int, action: str, details: str = "") -> str:
+    row = db.execute(
+        "SELECT user_id,username,full_name FROM contacts WHERE owner_id=? AND chat_id=?",
+        (owner_id, chat_id),
+    ).fetchone()
+    if not row:
+        # Backfill identity from messages saved by earlier bot versions.
+        row = db.execute(
+            "SELECT from_id,from_username,from_name FROM messages "
+            "WHERE chat_id=? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?) "
+            "AND from_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (chat_id, owner_id),
+        ).fetchone()
+        if row:
+            db.execute("INSERT OR REPLACE INTO contacts(owner_id,chat_id,user_id,username,full_name,updated_at) VALUES(?,?,?,?,?,?)",
+                       (owner_id,chat_id,row[0],row[1],row[2],time.time()))
+            db.commit()
+    if row:
+        user_id, username, full_name = row
+    else:
+        user_id, username = None, None
+        full_name = get_chat_display_name(owner_id, chat_id)
+    name = html.escape(full_name or "Невідомо")
+    uname = f"@{html.escape(username)}" if username else "Відсутній"
+    uid = f"<code>{user_id}</code>" if user_id else "Невідомий (Telegram не передав ID користувача)"
+    lines = ["👤 <b>Інформація про користувача</b>", f"<b>Дія:</b> {html.escape(action)}",
+             f"<b>Ім'я:</b> {name}", f"<b>Username:</b> {uname}",
+             f"<b>User ID:</b> {uid}", f"<b>Chat ID:</b> <code>{chat_id}</code>"]
+    if details:
+        lines.append(f"<b>Деталі:</b> {html.escape(details)}")
+    return "\n".join(lines)
+
+
+async def notify_contact(bot: Bot, owner_chat: int, owner_id: int, chat_id: int,
+                         action: str, details: str = ""):
+    db.execute("INSERT INTO event_logs(owner_id,chat_id,action,details,ts) VALUES(?,?,?,?,?)",
+               (owner_id, chat_id, action, details, time.time()))
+    db.commit()
+    await bot.send_message(owner_chat, contact_card(owner_id, chat_id, action, details))
+
+
+def log_event(owner_id: int, chat_id: int | None, action: str, details: str = ""):
+    db.execute("INSERT INTO event_logs(owner_id,chat_id,action,details,ts) VALUES(?,?,?,?,?)",
+               (owner_id, chat_id, action, details, time.time()))
+    db.commit()
+
+
+async def openai_text(prompt: str, system: str = "Ти корисний асистент. Відповідай українською.") -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Не задано OPENAI_API_KEY у змінних середовища.")
+    payload = {"model": OPENAI_MODEL,
+               "input": [{"role": "system", "content": system},
+                         {"role": "user", "content": prompt}],
+               "max_output_tokens": 900}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post("https://api.openai.com/v1/responses", json=payload, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
+                raise RuntimeError(msg)
+    if data.get("output_text"):
+        return data["output_text"].strip()
+    parts = []
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                parts.append(content.get("text", ""))
+    return "\n".join(parts).strip() or "Модель не повернула текстову відповідь."
+
+
+async def ai_command(m: Message, mode: str):
+    parts = (m.text or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    owner_id = m.from_user.id
+    chat_id = None
+    target_arg = arg
+    translate_lang = "українська"
+    if mode == "translate" and arg:
+        chunks = arg.split()
+        target_arg = chunks[0]
+        if len(chunks) > 1:
+            translate_lang = chunks[1]
+    if mode in ("summarize", "reply", "translate", "explain", "sentiment"):
+        lookup = target_arg[1:] if target_arg.startswith("@") else target_arg
+        rows = db.execute(
+            "SELECT chat_id FROM chat_names WHERE owner_id=? AND name LIKE ? ORDER BY chat_id LIMIT 1",
+            (owner_id, f"%{lookup}%"),
+        ).fetchall() if lookup and not lookup.isdigit() else []
+        if rows:
+            chat_id = rows[0][0]
+        elif lookup.isdigit():
+            chat_id = int(lookup)
+    if mode == "ai":
+        if not arg:
+            await m.answer("Використання: <code>/ai твоє запитання</code>")
+            return
+        prompt = arg
+        system = "Ти персональний асистент. Відповідай українською, чітко й коректно."
+    else:
+        if not chat_id:
+            await m.answer("Вкажи ID або частину назви контакту. Наприклад: <code>/summarize 123456789</code>")
+            return
+        rows = db.execute(
+            "SELECT from_name,text,created_at FROM messages WHERE chat_id=? AND conn_id IN "
+            "(SELECT conn_id FROM connections WHERE owner_id=?) ORDER BY created_at DESC LIMIT 80",
+            (chat_id, owner_id),
+        ).fetchall()
+        rows.reverse()
+        transcript = "\n".join(f"{n}: {t or '[медіа]'}" for n,t,_ in rows if t or n)
+        if not transcript:
+            await m.answer("Для цього контакту ще немає збереженої історії.")
+            return
+        prompts = {
+            "summarize": "Стисло підсумуй переписку, виділи домовленості, питання й важливі факти.",
+            "reply": "Запропонуй 3 природні варіанти відповіді на останнє повідомлення співрозмовника.",
+            "translate": f"Переклади переписку мовою {translate_lang}. Не додавай пояснень.",
+            "explain": "Поясни простими словами зміст останнього повідомлення та можливий підтекст, не вигадуй факти.",
+            "sentiment": "Проаналізуй тон спілкування нейтрально, наведи ознаки, не став діагнозів і не роби категоричних висновків про людину.",
+        }
+        system = "Аналізуй лише наданий текст. Не домислюй відсутні факти. Відповідай українською."
+        prompt = prompts[mode] + "\n\nІСТОРІЯ:\n" + transcript[-18000:]
+    try:
+        answer = await openai_text(prompt, system)
+        await m.answer("🤖 <b>Відповідь ШІ</b>\n\n" + html.escape(answer[:4000]))
+    except Exception as e:
+        logging.exception("OpenAI request failed")
+        await m.answer("⚠️ Не вдалося отримати відповідь ШІ: " + html.escape(str(e)[:500]))
 
 
 # ---------------------- КЛАВІАТУРИ ----------------------
@@ -807,6 +1007,272 @@ async def cmd_cleanup(m: Message):
     await m.answer(f"🧹 Збережені повідомлення видалятимуться через {days} дн.")
 
 
+# ---------------------- НОВІ КОМАНДИ: ШІ, АНАЛІТИКА, БЕЗПЕКА ----------------------
+@router.message(Command("ai"))
+async def cmd_ai(m: Message): await ai_command(m, "ai")
+@router.message(Command("summarize"))
+async def cmd_summarize(m: Message): await ai_command(m, "summarize")
+@router.message(Command("reply"))
+async def cmd_reply(m: Message): await ai_command(m, "reply")
+@router.message(Command("translate"))
+async def cmd_translate(m: Message): await ai_command(m, "translate")
+@router.message(Command("explain"))
+async def cmd_explain(m: Message): await ai_command(m, "explain")
+@router.message(Command("sentiment"))
+async def cmd_sentiment(m: Message): await ai_command(m, "sentiment")
+
+@router.message(Command("smartsearch"))
+async def cmd_smartsearch(m: Message):
+    parts=(m.text or "").split(maxsplit=1)
+    if len(parts)<2:
+        await m.answer("Формат: <code>/smartsearch про що домовлялися щодо зустрічі</code>"); return
+    owner_id=m.from_user.id
+    rows=db.execute("SELECT from_name,text,chat_id,created_at FROM messages WHERE conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?) AND text IS NOT NULL ORDER BY created_at DESC LIMIT 100",(owner_id,)).fetchall()
+    if not rows:
+        await m.answer("Немає збережених текстових повідомлень для пошуку."); return
+    corpus="\n".join(f"[{datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M')}] chat={cid} {name}: {txt}" for name,txt,cid,ts in rows)
+    try:
+        answer=await openai_text("Знайди повідомлення, які за змістом відповідають запиту. Поверни короткий список з датою, Chat ID, автором і фрагментом. Якщо збігів немає — так і скажи. Не вигадуй.\nЗАПИТ: "+parts[1]+"\nКАНДИДАТИ:\n"+corpus[-20000:],"Ти виконуєш пошук по наданому корпусу повідомлень. Використовуй лише наведені дані.")
+        await m.answer("🧠 <b>Семантичний пошук</b>\n\n"+html.escape(answer[:4000]))
+    except Exception as e:
+        await m.answer("⚠️ Помилка пошуку: "+html.escape(str(e)[:400]))
+
+@router.message(Command("tag"))
+async def cmd_tag(m: Message):
+    parts=(m.text or "").split(maxsplit=2)
+    if len(parts)<3: await m.answer("Формат: <code>/tag CHAT_ID мітка</code>"); return
+    try: cid=int(parts[1])
+    except ValueError: await m.answer("Chat ID має бути числом."); return
+    db.execute("INSERT OR REPLACE INTO tags(owner_id,chat_id,tag) VALUES(?,?,?)",(m.from_user.id,cid,parts[2])); db.commit()
+    await m.answer(f"🏷 Контакту {cid} присвоєно мітку «{html.escape(parts[2])}».")
+
+@router.message(Command("top"))
+async def cmd_top(m: Message):
+    since=time.time()-7*86400
+    rows=db.execute("SELECT chat_id,COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? AND chat_id IS NOT NULL GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 10",(m.from_user.id,since)).fetchall()
+    await m.answer("🏆 <b>Найактивніші контакти за 7 днів</b>\n\n"+("\n".join(f"• {html.escape(get_chat_display_name(m.from_user.id,cid))} — {n}" for cid,n in rows) if rows else "Поки немає даних."))
+
+@router.message(Command("activity"))
+async def cmd_activity(m: Message):
+    since=time.time()-7*86400
+    rows=db.execute("SELECT date(ts,'unixepoch','localtime'),COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? GROUP BY 1 ORDER BY 1",(m.from_user.id,since)).fetchall()
+    await m.answer("📈 <b>Активність за 7 днів</b>\n\n"+("\n".join(f"{d}: {n} подій" for d,n in rows) if rows else "Даних поки немає."))
+
+@router.message(Command("inactive"))
+async def cmd_inactive(m: Message):
+    cutoff=time.time()-7*86400
+    rows=db.execute("SELECT c.chat_id,c.name,a.ts FROM chat_names c LEFT JOIN chat_activity a ON a.owner_id=c.owner_id AND a.chat_id=c.chat_id WHERE c.owner_id=? AND (a.ts IS NULL OR a.ts<?) ORDER BY a.ts LIMIT 30",(m.from_user.id,cutoff)).fetchall()
+    await m.answer("💤 <b>Контакти без активності понад 7 днів</b>\n\n"+("\n".join(f"• {html.escape(n or str(cid))} — {('ніколи' if ts is None else datetime.fromtimestamp(ts).strftime('%d.%m.%Y'))}" for cid,n,ts in rows) if rows else "Таких контактів не знайдено."))
+
+@router.message(Command("chatstats"))
+async def cmd_chatstats(m: Message):
+    parts=m.text.split(maxsplit=1)
+    if len(parts)<2: await m.answer("Формат: <code>/chatstats CHAT_ID</code>"); return
+    try: cid=int(parts[1])
+    except ValueError: await m.answer("Потрібен числовий Chat ID."); return
+    rows=db.execute("SELECT event,COUNT(*) FROM stats_log WHERE owner_id=? AND chat_id=? AND ts>=? GROUP BY event",(m.from_user.id,cid,time.time()-7*86400)).fetchall()
+    await m.answer(contact_card(m.from_user.id,cid,"Статистика контакту")+"\n\n"+("\n".join(f"{e}: {n}" for e,n in rows) if rows else "Подій за 7 днів немає."))
+
+@router.message(Command("deleted"))
+async def cmd_deleted(m: Message):
+    since=time.time()-7*86400
+    n=db.execute("SELECT COUNT(*) FROM stats_log WHERE owner_id=? AND event='deleted' AND ts>=?",(m.from_user.id,since)).fetchone()[0]
+    await m.answer(f"🗑 Видалень за 7 днів: <b>{n}</b>")
+
+@router.message(Command("edited"))
+async def cmd_edited(m: Message):
+    since=time.time()-7*86400
+    n=db.execute("SELECT COUNT(*) FROM stats_log WHERE owner_id=? AND event='edited' AND ts>=?",(m.from_user.id,since)).fetchone()[0]
+    await m.answer(f"✏️ Редагувань за 7 днів: <b>{n}</b>")
+
+@router.message(Command("report"))
+async def cmd_report(m: Message):
+    since=time.time()-7*86400
+    rows=db.execute("SELECT event,COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? GROUP BY event",(m.from_user.id,since)).fetchall()
+    top=db.execute("SELECT chat_id,COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? AND chat_id IS NOT NULL GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 5",(m.from_user.id,since)).fetchall()
+    body="\n".join(f"• {e}: {n}" for e,n in rows) or "Подій немає."
+    body += "\n\n<b>Топ контактів:</b>\n" + ("\n".join(f"• {html.escape(get_chat_display_name(m.from_user.id,c))}: {n}" for c,n in top) or "Немає даних")
+    await m.answer("📊 <b>Звіт за 7 днів</b>\n\n"+body)
+
+@router.message(Command("security"))
+async def cmd_security(m: Message):
+    await m.answer("🔐 <b>Перевірка безпеки</b>\n\n"+
+        f"BOT_TOKEN: {'налаштований' if TOKEN else 'НЕ налаштований'}\n"+
+        f"OPENAI_API_KEY: {'налаштований' if OPENAI_API_KEY else 'не налаштований'}\n"+
+        f"Режим DND: {'увімкнений' if get_setting(m.from_user.id,'dnd_enabled') else 'вимкнений'}\n"+
+        f"Антиспам: {'увімкнений' if get_setting(m.from_user.id,'antispam_enabled') else 'вимкнений'}\n"+
+        "Рекомендація: не надсилай токени або ключі в чатах і зберігай їх лише у змінних середовища.")
+
+@router.message(Command("logs"))
+async def cmd_logs(m: Message):
+    rows=db.execute("SELECT action,details,ts,chat_id FROM event_logs WHERE owner_id=? ORDER BY ts DESC LIMIT 20",(m.from_user.id,)).fetchall()
+    await m.answer("📜 <b>Останні події</b>\n\n"+("\n".join(f"{datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')} — {html.escape(a)} — {html.escape(str(cid))} {html.escape(d or '')}" for a,d,ts,cid in rows) if rows else "Журнал поки порожній."))
+
+@router.message(Command("backup"))
+async def cmd_backup(m: Message):
+    owner_id=m.from_user.id
+    parts=(m.text or "").split(maxsplit=1)
+    if len(parts)>1 and parts[1].strip().lower() in ("auto","off"):
+        enabled=parts[1].strip().lower()=="auto"
+        get_setting(owner_id,"auto_backup_enabled")
+        db.execute("UPDATE settings SET auto_backup_enabled=? WHERE owner_id=?",(int(enabled),owner_id)); db.commit()
+        await m.answer("🛡 Щотижневе резервне копіювання увімкнено. Копія надсилатиметься в понеділок." if enabled else "Автоматичне резервне копіювання вимкнено.")
+        return
+    path=f"backup_{owner_id}_{int(time.time())}.db"
+    target=sqlite3.connect(path)
+    try: db.commit(); db.backup(target)
+    finally: target.close()
+    await m.answer_document(FSInputFile(path),caption="🛡 Резервна копія бази даних. Зберігай файл у безпечному місці.")
+    os.remove(path)
+
+@router.message(Command("restore"))
+async def cmd_restore(m: Message):
+    if not m.reply_to_message or not m.reply_to_message.document:
+        await m.answer("Відповідай командою /restore на повідомлення з резервною копією .db.")
+        return
+    doc=m.reply_to_message.document
+    if not (doc.file_name or "").lower().endswith((".db",".sqlite",".sqlite3")):
+        await m.answer("Потрібен файл резервної копії SQLite (.db/.sqlite/.sqlite3).")
+        return
+    info=await m.bot.get_file(doc.file_id)
+    temp=f"restore_upload_{m.from_user.id}.db"
+    await m.bot.download_file(info.file_path,temp)
+    backup=f"before_restore_{m.from_user.id}_{int(time.time())}.db"
+    try:
+        test=sqlite3.connect(temp)
+        check=test.execute("PRAGMA integrity_check").fetchone()[0]
+        tables={r[0] for r in test.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if check!="ok" or "connections" not in tables or "messages" not in tables:
+            test.close()
+            await m.answer("Файл не пройшов перевірку цілісності або не схожий на базу цього бота.")
+            return
+        db.commit()
+        current=sqlite3.connect("bot.db")
+        try: db.backup(current)
+        finally: current.close()
+        try:
+            test.backup(db)
+            db.commit()
+            # Міграції для резервних копій старішої версії.
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS contacts(owner_id INTEGER,chat_id INTEGER,user_id INTEGER,username TEXT,full_name TEXT,first_name TEXT,last_name TEXT,updated_at REAL,PRIMARY KEY(owner_id,chat_id));
+            CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,chat_id INTEGER,action TEXT,details TEXT,ts REAL);
+            CREATE TABLE IF NOT EXISTS whitelist(owner_id INTEGER,chat_id INTEGER,PRIMARY KEY(owner_id,chat_id));
+            CREATE TABLE IF NOT EXISTS auto_rules(owner_id INTEGER,kind TEXT,value TEXT,enabled INTEGER DEFAULT 1,PRIMARY KEY(owner_id,kind));
+            CREATE TABLE IF NOT EXISTS tags(owner_id INTEGER,chat_id INTEGER,tag TEXT,PRIMARY KEY(owner_id,chat_id));
+            CREATE TABLE IF NOT EXISTS chat_activity(owner_id INTEGER,chat_id INTEGER,ts REAL,PRIMARY KEY(owner_id,chat_id));
+            """)
+            for table,col,decl in [("settings","antiflood_limit","INTEGER DEFAULT 0"),("settings","autotranslate_enabled","INTEGER DEFAULT 0"),("settings","autotranslate_lang","TEXT DEFAULT 'uk'"),("settings","autonote_keyword","TEXT DEFAULT ''"),("settings","antispam_enabled","INTEGER DEFAULT 0"),("settings","vip_only","INTEGER DEFAULT 0"),("settings","auto_delete_hours","INTEGER DEFAULT 0"),("settings","auto_backup_enabled","INTEGER DEFAULT 0"),("settings","dnd_enabled","INTEGER DEFAULT 0"),("settings","dnd_start","TEXT DEFAULT '23:00'"),("settings","dnd_end","TEXT DEFAULT '08:00'"),("settings","autoreply_enabled","INTEGER DEFAULT 0"),("settings","autoreply_text","TEXT DEFAULT ''"),("settings","autoreply_start","TEXT DEFAULT ''"),("settings","autoreply_end","TEXT DEFAULT ''"),("settings","cleanup_days","INTEGER DEFAULT 30"),("settings","voice_transcribe_enabled","INTEGER DEFAULT 0"),("settings","weekly_report_enabled","INTEGER DEFAULT 0"),("muted","until","REAL"),("muted","chat_name","TEXT"),("scheduled_tasks","recurrence","TEXT"),("scheduled_tasks","weekday","INTEGER"),("scheduled_tasks","hhmm","TEXT"),("messages","from_id","INTEGER"),("messages","from_username","TEXT"),("messages","created_at","REAL DEFAULT 0"),("stats_log","chat_id","INTEGER")]:
+                ensure_column(table,col,decl)
+            db.commit()
+        except Exception:
+            rollback=sqlite3.connect(backup)
+            try: rollback.backup(db); db.commit()
+            finally: rollback.close()
+            raise
+        test.close()
+        await m.answer("✅ Базу відновлено. Перед відновленням поточну базу збережено в окремій резервній копії на сервері.")
+    except Exception as e:
+        logging.exception("Restore failed")
+        await m.answer("⚠️ Не вдалося відновити базу: "+html.escape(str(e)[:400]))
+    finally:
+        if os.path.exists(temp): os.remove(temp)
+
+@router.message(Command("whitelist"))
+async def cmd_whitelist(m: Message):
+    rows=db.execute("SELECT w.chat_id,c.name FROM whitelist w LEFT JOIN chat_names c ON c.owner_id=w.owner_id AND c.chat_id=w.chat_id WHERE w.owner_id=?",(m.from_user.id,)).fetchall()
+    await m.answer("📋 <b>Дозволені контакти</b>\n\n"+("\n".join(f"• {html.escape(n or str(cid))} — <code>{cid}</code>" for cid,n in rows) if rows else "Список порожній. Команда !дозволити у чаті додає контакт."))
+
+@router.message(Command("antiflood"))
+async def cmd_antiflood(m: Message):
+    parts=m.text.split(maxsplit=1)
+    if len(parts)<2 or not parts[1].isdigit():
+        await m.answer("Формат: <code>/antiflood 20</code> (повідомлень/хв), або <code>/antiflood 0</code> для вимкнення."); return
+    limit=max(0,min(300,int(parts[1])))
+    get_setting(m.from_user.id,"antiflood_limit")
+    db.execute("UPDATE settings SET antiflood_limit=? WHERE owner_id=?",(limit,m.from_user.id)); db.commit()
+    await m.answer(f"🛡 Антифлуд: {'вимкнено' if not limit else str(limit)+' повідомлень за хвилину'}.")
+
+@router.message(Command("autotranslate"))
+async def cmd_autotranslate(m: Message):
+    parts=m.text.split(maxsplit=1); arg=parts[1].strip() if len(parts)>1 else "on uk"
+    get_setting(m.from_user.id,"autotranslate_enabled")
+    if arg.lower()=="off":
+        db.execute("UPDATE settings SET autotranslate_enabled=0 WHERE owner_id=?",(m.from_user.id,)); db.commit(); await m.answer("Автопереклад вимкнено."); return
+    lang=arg.split()[-1] if arg.lower().startswith("on ") else arg
+    db.execute("UPDATE settings SET autotranslate_enabled=1,autotranslate_lang=? WHERE owner_id=?",(lang,m.from_user.id)); db.commit()
+    await m.answer(f"🌐 Автопереклад увімкнено. Мова: {html.escape(lang)}. Для вимкнення: /autotranslate off")
+
+@router.message(Command("autonote"))
+async def cmd_autonote(m: Message):
+    parts=m.text.split(maxsplit=1)
+    if len(parts)<2: await m.answer("Формат: <code>/autonote ключове_слово</code> або <code>/autonote off</code>"); return
+    value="" if parts[1].strip().lower()=="off" else parts[1].strip()
+    db.execute("UPDATE settings SET autonote_keyword=? WHERE owner_id=?",(value,m.from_user.id)); db.commit()
+    await m.answer("Автоматичні нотатки вимкнено." if not value else f"📝 Зберігатиму повідомлення, що містять «{html.escape(value)}».")
+
+@router.message(Command("autotag"))
+async def cmd_autotag(m: Message):
+    parts=(m.text or "").split(maxsplit=2)
+    if len(parts)<2:
+        await m.answer("Формат: <code>/autotag ключове_слово назва_мітки</code> або <code>/autotag off</code>"); return
+    if parts[1].lower()=="off":
+        db.execute("DELETE FROM auto_rules WHERE owner_id=? AND kind='tag'",(m.from_user.id,)); db.commit()
+        await m.answer("Автоматичне тегування вимкнено."); return
+    if len(parts)<3:
+        await m.answer("Формат: <code>/autotag ключове_слово назва_мітки</code>"); return
+    db.execute("INSERT OR REPLACE INTO auto_rules(owner_id,kind,value,enabled) VALUES(?,?,?,1)",(m.from_user.id,"tag",parts[1]+"|"+parts[2])); db.commit()
+    await m.answer(f"🏷 Автотегування увімкнено: слово «{html.escape(parts[1])}» → мітка «{html.escape(parts[2])}».")
+
+@router.message(Command("tags"))
+async def cmd_tags(m: Message):
+    rows=db.execute("SELECT t.chat_id,t.tag,c.name FROM tags t LEFT JOIN chat_names c ON c.owner_id=t.owner_id AND c.chat_id=t.chat_id WHERE t.owner_id=? ORDER BY t.tag",(m.from_user.id,)).fetchall()
+    await m.answer("🏷 <b>Мітки контактів</b>\n\n"+("\n".join(f"• {html.escape(n or str(cid))}: {html.escape(tag)}" for cid,tag,n in rows) if rows else "Міток ще немає."))
+
+@router.message(Command("rules"))
+async def cmd_rules(m: Message):
+    await m.answer("⚙️ <b>Активні правила</b>\n\n"+
+      f"Антифлуд: {get_setting_value(m.from_user.id,'antiflood_limit') or 0} повідомлень/хв\n"+
+      f"Автопереклад: {'так' if get_setting(m.from_user.id,'autotranslate_enabled') else 'ні'}\n"+
+      f"Автонотатка: {html.escape(get_setting_value(m.from_user.id,'autonote_keyword') or 'вимкнено')}\n"+
+      f"DND: {'так' if get_setting(m.from_user.id,'dnd_enabled') else 'ні'}")
+
+
+@router.message(Command("daily"))
+async def cmd_daily(m: Message):
+    since=time.time()-86400
+    rows=db.execute("SELECT event,COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? GROUP BY event",(m.from_user.id,since)).fetchall()
+    await m.answer("📅 <b>Підсумок за останні 24 години</b>\n\n"+("\n".join(f"• {e}: {n}" for e,n in rows) if rows else "Подій не було."))
+
+@router.message(Command("schedule"))
+async def cmd_schedule(m: Message):
+    await cmd_tasks(m)
+
+@router.message(Command("blocked"))
+async def cmd_blocked(m: Message):
+    rows=db.execute("SELECT chat_id,chat_name,until FROM muted WHERE owner_id=? ORDER BY chat_name",(m.from_user.id,)).fetchall()
+    if not rows:
+        await m.answer("🔇 Список замучених контактів порожній."); return
+    lines=[]
+    for cid,name,until in rows:
+        ending="назавжди" if not until else datetime.fromtimestamp(until).strftime("до %d.%m %H:%M")
+        lines.append(f"• {html.escape(name or get_chat_display_name(m.from_user.id,cid))} — {ending} — <code>{cid}</code>")
+    await m.answer("🔇 <b>Замучені контакти</b>\n\n"+"\n".join(lines))
+
+@router.message(Command("antispam"))
+async def cmd_antispam(m: Message):
+    get_setting(m.from_user.id,"antispam_enabled")
+    db.execute("UPDATE settings SET antispam_enabled=1-antispam_enabled WHERE owner_id=?",(m.from_user.id,)); db.commit()
+    state=get_setting(m.from_user.id,"antispam_enabled")
+    await m.answer("🛡 Антиспам увімкнено: дублікати повідомлень будуть позначатися." if state else "Антиспам вимкнено.")
+
+@router.message(Command("viponly"))
+async def cmd_viponly(m: Message):
+    get_setting(m.from_user.id,"vip_only")
+    db.execute("UPDATE settings SET vip_only=1-vip_only WHERE owner_id=?",(m.from_user.id,)); db.commit()
+    await m.answer("⭐ Тепер сповіщення надходитимуть лише від VIP." if get_setting(m.from_user.id,"vip_only") else "Сповіщення знову надходитимуть від усіх контактів (з урахуванням DND).")
+
+
 # ---------------------- КНОПКИ-ЯРЛИКИ ПІД ПОЛЕМ ВВОДУ ----------------------
 @router.message(F.text == "🏠 Меню")
 async def btn_menu(m: Message):
@@ -960,43 +1426,113 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
         else:
             note = f"🔇 Замучено назавжди: {html.escape(m.chat.full_name or str(m.chat.id))}"
         db.commit()
-        await bot.send_message(owner_chat, note)
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Користувача замучено", (parts[1] if len(parts)>1 else "Назавжди"))
 
     elif lower == "!анмут":
         db.execute("DELETE FROM muted WHERE owner_id=? AND chat_id=?", (owner_id, m.chat.id))
         db.commit()
-        await bot.send_message(
-            owner_chat, f"🔊 Мут знято: {html.escape(m.chat.full_name or str(m.chat.id))}"
-        )
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Мут знято")
 
-    elif lower == "!вип":
+    elif lower in ("!вип", "!важливий"):
         db.execute("INSERT OR IGNORE INTO vip VALUES(?,?)", (owner_id, m.chat.id))
         db.commit()
-        await bot.send_message(
-            owner_chat,
-            f"⭐ {html.escape(m.chat.full_name or str(m.chat.id))} тепер VIP — "
-            "сповіщення проходитимуть навіть у «не турбувати».",
-        )
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Додано VIP", "Сповіщення проходитимуть навіть у DND")
 
-    elif lower == "!анвип":
+    elif lower in ("!анвип", "!анважливий"):
         db.execute("DELETE FROM vip WHERE owner_id=? AND chat_id=?", (owner_id, m.chat.id))
         db.commit()
-        await bot.send_message(owner_chat, "⭐ Статус VIP знято.")
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Статус VIP знято")
 
     elif lower == "!ігнор":
         db.execute("INSERT OR IGNORE INTO ignored_chats VALUES(?,?)", (owner_id, m.chat.id))
         db.commit()
-        await bot.send_message(
-            owner_chat,
-            f"🙈 Чат додано до ігнорованих: {html.escape(m.chat.full_name or str(m.chat.id))}",
-        )
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Чат додано до ігнорованих")
 
     elif lower == "!деігнор":
         db.execute(
             "DELETE FROM ignored_chats WHERE owner_id=? AND chat_id=?", (owner_id, m.chat.id)
         )
         db.commit()
-        await bot.send_message(owner_chat, "👁 Чат видалено з ігнорованих.")
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Чат прибрано з ігнорованих")
+
+    elif lower == "!дозволити":
+        db.execute("INSERT OR IGNORE INTO whitelist VALUES(?,?)", (owner_id, m.chat.id))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Контакт додано до дозволених")
+
+    elif lower == "!заборонити":
+        db.execute("DELETE FROM whitelist WHERE owner_id=? AND chat_id=?", (owner_id, m.chat.id))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Контакт прибрано зі списку дозволених")
+
+    elif lower == "!антиспам":
+        get_setting(owner_id, "antispam_enabled")
+        db.execute("UPDATE settings SET antispam_enabled=1-antispam_enabled WHERE owner_id=?", (owner_id,))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Перемкнуто антиспам у налаштуваннях", "Перемикач діє для всього акаунта")
+
+    elif lower.startswith("!тихийрежим"):
+        parts = text.split(maxsplit=1)
+        duration = parse_duration(parts[1]) if len(parts)>1 else None
+        if duration and duration >= 86400:
+            await bot.send_message(owner_chat,"Для !тихийрежим вкажи тривалість до 23 год 59 хв.")
+            return
+        get_setting(owner_id, "dnd_enabled")
+        if duration:
+            start_clock=datetime.now().strftime("%H:%M")
+            end_clock=(datetime.now()+timedelta(seconds=duration)).strftime("%H:%M")
+            db.execute("UPDATE settings SET dnd_enabled=1,dnd_start=?,dnd_end=? WHERE owner_id=?", (start_clock,end_clock,owner_id))
+            db.execute("INSERT INTO scheduled_tasks(owner_id,chat_id,conn_id,type,run_at,payload) VALUES(?,?,?,?,?,?)",
+                       (owner_id,None,None,"dnd_off",time.time()+duration,None))
+        else:
+            db.execute("UPDATE settings SET dnd_enabled=1 WHERE owner_id=?", (owner_id,))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Увімкнено тихий режим", parts[1] if len(parts)>1 else "До ручного вимкнення")
+
+    elif lower == "!тількиважливі":
+        get_setting(owner_id, "vip_only")
+        db.execute("UPDATE settings SET vip_only=1-vip_only WHERE owner_id=?", (owner_id,))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Перемкнено режим лише важливих контактів")
+
+    elif lower.startswith("!повтор "):
+        parts=text.split(maxsplit=1)
+        duration=parse_duration(parts[1]) if len(parts)>1 else None
+        if not duration:
+            await bot.send_message(owner_chat,"Формат: <code>!повтор 10м</code>")
+        else:
+            db.execute("INSERT INTO scheduled_tasks(owner_id,chat_id,conn_id,type,run_at,payload) VALUES(?,?,?,?,?,?)",
+                       (owner_id,m.chat.id,m.business_connection_id,"notify_repeat",time.time()+duration,"Повторне нагадування про контакт"))
+            db.commit()
+            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Заплановано повторне сповіщення",parts[1])
+
+    elif lower.startswith("!закріпити "):
+        note_text=text.split(maxsplit=1)[1]
+        db.execute("INSERT INTO notes(owner_id,text,created_at) VALUES(?,?,?)",(owner_id,note_text,time.time())); db.commit()
+        await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Текст збережено як нотатку")
+
+    elif lower == "!цитата":
+        row=db.execute("SELECT text,from_name FROM messages WHERE conn_id=? AND chat_id=? ORDER BY created_at DESC LIMIT 1",(m.business_connection_id,m.chat.id)).fetchone()
+        if row:
+            await bot.send_message(owner_chat,contact_card(owner_id,m.chat.id,"Останнє збережене повідомлення")+"\n\n"+f"<b>{html.escape(row[1] or '')}:</b>\n{html.escape(row[0] or '[медіа]')}")
+        else:
+            await bot.send_message(owner_chat,"Для цього контакту ще немає збережених повідомлень.")
+
+    elif lower == "!очиститиісторію":
+        db.execute("DELETE FROM messages WHERE conn_id=? AND chat_id=?",(m.business_connection_id,m.chat.id))
+        db.execute("DELETE FROM message_versions WHERE conn_id=? AND chat_id=?",(m.business_connection_id,m.chat.id))
+        db.commit()
+        await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Локальну збережену історію очищено")
+
+    elif lower.startswith("!автовидалення "):
+        parts=text.split(maxsplit=1); duration=parse_duration(parts[1]) if len(parts)>1 else None
+        if duration is None or duration % 3600:
+            await bot.send_message(owner_chat,"Формат: <code>!автовидалення 24г</code> або <code>!автовидалення 0г</code> для вимкнення")
+        else:
+            hours=duration//3600
+            get_setting(owner_id,"auto_delete_hours")
+            db.execute("UPDATE settings SET auto_delete_hours=? WHERE owner_id=?",(hours,owner_id)); db.commit()
+            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Змінено термін зберігання копій",f"{hours} годин; 0 вимикає")
 
     elif lower.startswith("!нотатка "):
         note_text = text.split(maxsplit=1)[1]
@@ -1005,7 +1541,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             (owner_id, note_text, time.time()),
         )
         db.commit()
-        await bot.send_message(owner_chat, f"📝 Нотатку збережено: {html.escape(note_text)}")
+        await bot.send_message(owner_chat, contact_card(owner_id,m.chat.id,"Збережено нотатку") + f"\n\n📝 {html.escape(note_text)}")
 
     elif lower.startswith("!нагадай "):
         rest = text.split(maxsplit=1)[1]
@@ -1039,7 +1575,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
                     "weekly": f"щотижня в {WEEKDAY_NAMES.get(weekday, '?')}",
                 }[recurrence]
                 await bot.send_message(
-                    owner_chat, f"⏰ Нагадаю ({when_label}, о {hhmm}): {html.escape(rtext)}"
+                    owner_chat, contact_card(owner_id,m.chat.id,"Створено нагадування",f"{when_label}, {hhmm}") + f"\n\n⏰ {html.escape(rtext)}"
                 )
 
     elif lower.startswith("!через "):
@@ -1056,7 +1592,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
                  time.time() + duration, rparts[1]),
             )
             db.commit()
-            await bot.send_message(owner_chat, f"📨 Повідомлення надійде через {html.escape(rparts[0])}.")
+            await bot.send_message(owner_chat, contact_card(owner_id,m.chat.id,"Заплановано відкладене повідомлення",rparts[0]))
 
     elif lower.startswith("!шаблон "):
         parts = text.split(maxsplit=2)
@@ -1066,7 +1602,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             _, name, body = parts
             db.execute("INSERT OR REPLACE INTO templates VALUES(?,?,?)", (owner_id, name, body))
             db.commit()
-            await bot.send_message(owner_chat, f"💾 Шаблон «{html.escape(name)}» збережено.")
+            await bot.send_message(owner_chat, contact_card(owner_id,m.chat.id,"Збережено шаблон відповіді",name))
 
     elif lower.startswith("!т "):
         name = text.split(maxsplit=1)[1].strip()
@@ -1099,9 +1635,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             (owner_id, word, m.chat.id, "only"),
         )
         db.commit()
-        await bot.send_message(
-            owner_chat, f"🔑 «{html.escape(word)}» тепер стежитиме лише за цим чатом."
-        )
+        await bot.send_message(owner_chat, contact_card(owner_id,m.chat.id,"Обмежено ключове слово цим чатом",word))
 
     elif lower.startswith("!ключвиняток "):
         word = text.split(maxsplit=1)[1].strip()
@@ -1110,9 +1644,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             (owner_id, word, m.chat.id, "exclude"),
         )
         db.commit()
-        await bot.send_message(
-            owner_chat, f"🔑 «{html.escape(word)}» вимкнено саме для цього чату."
-        )
+        await bot.send_message(owner_chat, contact_card(owner_id,m.chat.id,"Вимкнено ключове слово для цього чату",word))
 
     elif lower.startswith("!автовідповідь"):
         parts = text.split(maxsplit=1)
@@ -1128,8 +1660,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
                     (owner_id, m.chat.id),
                 )
                 await bot.send_message(
-                    owner_chat, "🤖 Персональну автовідповідь для цього чату вимкнено "
-                    "(діятиме загальна, якщо увімкнена)."
+                    owner_chat, contact_card(owner_id,m.chat.id,"Персональну автовідповідь вимкнено")
                 )
             else:
                 db.execute(
@@ -1137,7 +1668,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
                     (owner_id, m.chat.id, arg),
                 )
                 await bot.send_message(
-                    owner_chat, f"🤖 Персональна автовідповідь для цього чату: {html.escape(arg)}"
+                    owner_chat, contact_card(owner_id,m.chat.id,"Налаштовано персональну автовідповідь",arg)
                 )
             db.commit()
 
@@ -1181,10 +1712,17 @@ async def on_message(m: Message, bot: Bot):
         await handle_owner_command(m, bot, owner_id, owner_chat)
         return
 
+    remember_contact(owner_id, m)
+
     if db.execute(
         "SELECT 1 FROM ignored_chats WHERE owner_id=? AND chat_id=?",
         (owner_id, m.chat.id),
     ).fetchone():
+        return
+
+    # Whitelist is opt-in: if at least one contact is listed, only those contacts trigger alerts.
+    allowed_count = db.execute("SELECT COUNT(*) FROM whitelist WHERE owner_id=?", (owner_id,)).fetchone()[0]
+    if allowed_count and not db.execute("SELECT 1 FROM whitelist WHERE owner_id=? AND chat_id=?", (owner_id,m.chat.id)).fetchone():
         return
 
     if is_muted(owner_id, m.chat.id):
@@ -1204,14 +1742,64 @@ async def on_message(m: Message, bot: Bot):
             if voice_text:
                 await bot.send_message(
                     owner_chat,
-                    f"🎙 Розпізнано ({html.escape(lang or '?')}), від "
-                    f"{html.escape(m.from_user.full_name if m.from_user else 'Невідомо')}:\n\n"
-                    f"{html.escape(voice_text)}",
+                    contact_card(owner_id, m.chat.id, "Отримано голосове повідомлення") + "\n\n"
+                    f"🎙 Розпізнано ({html.escape(lang or '?')}):\n\n{html.escape(voice_text)}",
                 )
         except Exception as e:
             logging.warning("Помилка розпізнавання голосового: %s", e)
 
     content = m.text or m.caption or ""
+    # Автоматична нотатка за ключовим словом
+    auto_note = get_setting_value(owner_id, "autonote_keyword") or ""
+    if content and auto_note and auto_note.lower() in content.lower():
+        db.execute("INSERT INTO notes(owner_id,text,created_at) VALUES(?,?,?)",
+                   (owner_id, f"[{m.chat.full_name or m.chat.id}] {content}", time.time()))
+        db.commit()
+        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Автоматично збережено нотатку", f"Збіг: {auto_note}")
+
+    # Автоматичне тегування контакту за ключовим словом
+    tag_rule=db.execute("SELECT value FROM auto_rules WHERE owner_id=? AND kind='tag' AND enabled=1",(owner_id,)).fetchone()
+    if content and tag_rule and "|" in tag_rule[0]:
+        tag_word,tag_name=tag_rule[0].split("|",1)
+        if tag_word.lower() in content.lower():
+            db.execute("INSERT OR REPLACE INTO tags(owner_id,chat_id,tag) VALUES(?,?,?)",(owner_id,m.chat.id,tag_name)); db.commit()
+            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Автоматично присвоєно мітку",tag_name)
+
+    # Автоматичний переклад тексту через OpenAI
+    if content and get_setting(owner_id, "autotranslate_enabled") and allowed_now(owner_id, m.chat.id):
+        lang = get_setting_value(owner_id, "autotranslate_lang") or "uk"
+        try:
+            translated = await openai_text(f"Translate this message into {lang}. Return only the translation:\n\n{content}")
+            await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "Автоматичний переклад") + "\n\n" + html.escape(translated[:3000]))
+        except Exception as e:
+            logging.warning("Auto-translate failed: %s", e)
+
+    # Антиспам: повтори однакового тексту від одного контакту за короткий час
+    if content and get_setting(owner_id, "antispam_enabled"):
+        key=(owner_id,m.chat.id); now=time.time(); q=SPAM_RECENT[key]
+        while q and now-q[0][0]>60: q.popleft()
+        q.append((now,content.strip().lower()))
+        duplicates=sum(1 for _,value in q if value==content.strip().lower())
+        if duplicates>=3:
+            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Виявлено повторюваний спам",f"Однаковий текст повторено {duplicates} рази за хвилину")
+            try: await bot.delete_business_messages(m.business_connection_id,[m.message_id])
+            except Exception: pass
+            return
+
+    # Антифлуд: ліміт повідомлень за хвилину; тільки повідомлення від контакту
+    flood_limit = int(get_setting_value(owner_id, "antiflood_limit") or 0)
+    if flood_limit:
+        key = (owner_id, m.chat.id)
+        now = time.time()
+        q = FLOOD_WINDOWS[key]
+        while q and now - q[0] > 60: q.popleft()
+        q.append(now)
+        if len(q) > flood_limit:
+            await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Виявлено флуд", f"{len(q)} повідомлень за хвилину")
+            try: await bot.delete_business_messages(m.business_connection_id,[m.message_id])
+            except Exception: pass
+            return
+
     if content and allowed_now(owner_id, m.chat.id):
         words = db.execute("SELECT word FROM keywords WHERE owner_id=?", (owner_id,)).fetchall()
         low = content.lower()
@@ -1230,8 +1818,8 @@ async def on_message(m: Message, bot: Bot):
                 continue
             await bot.send_message(
                 owner_chat,
-                f"🔑 Ключове слово «{html.escape(w)}» у повідомленні від "
-                f"{html.escape(m.from_user.full_name)}:\n\n{html.escape(content)}",
+                contact_card(owner_id, m.chat.id, "Знайдено ключове слово", w) + "\n\n"
+                f"🔑 <b>Повідомлення:</b>\n{html.escape(content)}",
             )
             break
 
@@ -1293,6 +1881,8 @@ async def on_edited(m: Message, bot: Bot):
     )
     db.commit()
 
+    if m.from_user:
+        remember_contact(owner_id, m)
     if get_setting(owner_id, "log_edits") and allowed_now(owner_id, m.chat.id):
         sender = format_sender(
             m.from_user.full_name if m.from_user else "Невідомо",
@@ -1312,7 +1902,7 @@ async def on_edited(m: Message, bot: Bot):
                     f"<blockquote>{html.escape(vtext) if vtext else '—'}</blockquote>"
                 )
             lines.append(f"<b>Нова версія</b>:\n<blockquote>{new_text}</blockquote>{footer}")
-            await bot.send_message(owner_chat, "\n\n".join(lines))
+            await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "Повідомлення відредаговано") + "\n\n" + "\n\n".join(lines))
         else:
             old_text = html.escape(prior_versions[0][0]) if prior_versions and prior_versions[0][0] else (
                 "<i>невідомо (до підключення бота)</i>"
@@ -1324,6 +1914,8 @@ async def on_edited(m: Message, bot: Bot):
                 f"New:\n<blockquote>{new_text}</blockquote>"
                 f"{footer}",
             )
+            # Окрема стандартна картка контакту для однакового формату сповіщень
+            await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "Повідомлення відредаговано"))
     cache_message(m)
 
 
@@ -1352,6 +1944,13 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
         if not row:
             continue
         deleted_rows.append(row)
+        # Якщо контакт ще не був у новій таблиці, відновлюємо картку з метаданих збереженого повідомлення.
+        name, saved_text, media_type, saved_file_id, saved_user_id, saved_username = row
+        if saved_user_id:
+            db.execute("INSERT OR REPLACE INTO contacts(owner_id,chat_id,user_id,username,full_name,updated_at) VALUES(?,?,?,?,?,?)",
+                       (owner_id,d.chat.id,saved_user_id,saved_username,name,time.time()))
+            db.execute("INSERT OR REPLACE INTO chat_names(owner_id,chat_id,name) VALUES(?,?,?)",
+                       (owner_id,d.chat.id,name or str(d.chat.id)))
 
         db.execute(
             "INSERT INTO stats_log(owner_id, event, ts, chat_id) VALUES(?,?,?,?)",
@@ -1364,12 +1963,13 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
             footer = f"\n\n@{BOT_USERNAME}" if BOT_USERNAME else ""
             header = f"{sender} видалив(ла) повідомлення:"
             if text:
-                body = f"{header}\n\n<blockquote>{html.escape(text)}</blockquote>{footer}"
+                body = contact_card(owner_id, d.chat.id, "Повідомлення видалено") + f"\n\n{header}\n\n<blockquote>{html.escape(text)}</blockquote>{footer}"
             else:
-                body = f"{header}{footer}"
+                body = contact_card(owner_id, d.chat.id, "Повідомлення видалено") + f"\n\n{header}{footer}"
 
             if mtype and fid and get_setting(owner_id, "log_media"):
                 try:
+                    await bot.send_message(owner_chat, contact_card(owner_id, d.chat.id, "Повідомлення з медіа видалено") + "\n\n" + header + footer)
                     if mtype in ("video_note", "sticker"):
                         await bot.send_message(owner_chat, header + footer)
                         await getattr(bot, f"send_{mtype}")(owner_chat, fid)
@@ -1442,7 +2042,13 @@ async def scheduler_loop(bot: Bot):
                             "DELETE FROM muted WHERE owner_id=? AND chat_id=?", (owner_id, chat_id)
                         )
                         if owner_chat:
-                            await bot.send_message(owner_chat, "🔊 Мут автоматично знято (час вийшов).")
+                            await bot.send_message(owner_chat, contact_card(owner_id, chat_id, "Мут автоматично знято", "Час дії завершився"))
+                    elif ttype == "dnd_off":
+                        db.execute("UPDATE settings SET dnd_enabled=0 WHERE owner_id=?", (owner_id,))
+                        if owner_chat:
+                            await bot.send_message(owner_chat, "🌙 Тихий режим автоматично вимкнено.")
+                    elif ttype == "notify_repeat" and owner_chat and chat_id:
+                        await bot.send_message(owner_chat, contact_card(owner_id, chat_id, "Повторне сповіщення", payload or ""))
                     elif ttype == "reminder" and owner_chat:
                         await bot.send_message(
                             owner_chat, f"⏰ <b>Нагадування:</b> {html.escape(payload or '')}"
@@ -1484,9 +2090,37 @@ async def scheduler_loop(bot: Bot):
                         (cutoff, owner_id),
                     )
                     db.execute(
+                        "DELETE FROM message_versions WHERE created_at < ? AND conn_id IN "
+                        "(SELECT conn_id FROM connections WHERE owner_id=?)",
+                        (cutoff, owner_id),
+                    )
+                    db.execute(
                         "INSERT OR REPLACE INTO daily_tasks VALUES(?,?,?)",
                         (owner_id, "cleanup", today),
                     )
+
+                # Додатковий короткий термін зберігання копій (години), якщо задано.
+                hours = int(get_setting_value(owner_id, "auto_delete_hours") or 0)
+                if hours > 0:
+                    cutoff_hours = now_ts - hours * 3600
+                    db.execute("DELETE FROM messages WHERE created_at < ? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?)", (cutoff_hours, owner_id))
+                    db.execute("DELETE FROM message_versions WHERE created_at < ? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?)", (cutoff_hours, owner_id))
+
+                # Автоматична резервна копія щопонеділка
+                if datetime.now().weekday() == 0 and get_setting(owner_id, "auto_backup_enabled"):
+                    last_b = db.execute("SELECT last_date FROM daily_tasks WHERE owner_id=? AND task='auto_backup'", (owner_id,)).fetchone()
+                    if (not last_b or last_b[0] != today) and owner_chat:
+                        backup_path=f"auto_backup_{owner_id}_{int(now_ts)}.db"
+                        backup_db=sqlite3.connect(backup_path)
+                        try:
+                            db.commit(); db.backup(backup_db)
+                        finally:
+                            backup_db.close()
+                        try:
+                            await bot.send_document(owner_chat, FSInputFile(backup_path), caption="🛡 Щотижнева автоматична резервна копія бази даних.")
+                        finally:
+                            if os.path.exists(backup_path): os.remove(backup_path)
+                        db.execute("INSERT OR REPLACE INTO daily_tasks VALUES(?,?,?)", (owner_id,"auto_backup",today))
 
                 # Тижневий звіт (раз на понеділок)
                 if datetime.now().weekday() == 0 and get_setting(owner_id, "weekly_report_enabled"):
@@ -1547,6 +2181,8 @@ async def start_web_server():
 # ЗАПУСК
 async def main():
     global BOT_USERNAME
+    if not TOKEN:
+        raise RuntimeError("Не задано BOT_TOKEN у змінних середовища. Додай токен у налаштуваннях хостингу.")
     await start_web_server()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.me()
