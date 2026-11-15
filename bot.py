@@ -312,7 +312,7 @@ HELP_PAGES = {
         "• Якщо сервер або бот вимкнений, події та заплановані дії можуть бути пропущені."
     ),
     "cmds": (
-        "📌 <b>Як користуватися командами</b>\n\n"
+        "📌 <b>Як користуватися командами</b>\n"
         "Команди з ! надсилай у відповідному особистому чаті від свого імені. Команди зі / надсилай безпосередньо цьому боту.\n\n"
         "<b>🔇 Команди в особистих чатах</b>\n\n"
         "<code>!мут</code> — додати контакт до списку замучених без обмеження часу.\n"
@@ -435,8 +435,7 @@ WELCOME = (
     "формувати статистику й звіти, експортувати історію, а також використовувати функції ШІ, "
     "перекладу, антиспаму й автоматизації — якщо відповідні модулі налаштовані.\n\n"
     "Для початку відкрий «Як підключити» та підключи його в розділі «Автоматизація чатів / Chat Automation». "
-    "У розділі «Команди» є повний перелік команд і пояснення, а в «Налаштуваннях» більшість "
-    "основних перемикачів доступна кнопками.\n\n"
+    "У розділі «Команди» є повний перелік команд і пояснення.\n\n"
     "⚠️ Бот зберігає копії повідомлень на сервері. Ознайомся з розділом «Приватність» перед підключенням."
 )
 
@@ -737,8 +736,7 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text="⚙️ Як це працює", callback_data="help:how")
     kb.button(text="🔇 Команди", callback_data="help:cmds")
     kb.button(text="🔒 Приватність", callback_data="help:privacy")
-    kb.button(text="🛠 Налаштування", callback_data="menu:settings")
-    kb.adjust(1, 1, 2, 1)
+    kb.adjust(1, 1, 2)
     return kb.as_markup()
 
 
@@ -846,7 +844,7 @@ def tasks_keyboard(owner_id: int):
 # ---------------------- МЕНЮ В ЧАТІ З БОТОМ ----------------------
 @router.message(Command("start", "help"))
 async def cmd_start(m: Message):
-    await m.answer(WELCOME, reply_markup=main_reply_keyboard())
+    await m.answer(WELCOME, reply_markup=main_menu())
 
 
 @router.message(Command("settings"))
@@ -1448,6 +1446,11 @@ async def btn_menu(m: Message):
     await cmd_start(m)
 
 
+@router.message(F.text == "🛠 Налаштування")
+async def btn_settings(m: Message):
+    await cmd_settings(m)
+
+
 @router.message(F.text == "📊 Статистика")
 async def btn_stats(m: Message):
     await cmd_stats(m)
@@ -1461,6 +1464,11 @@ async def btn_notes(m: Message):
 @router.message(F.text == "📋 Завдання")
 async def btn_tasks(m: Message):
     await cmd_tasks(m)
+
+
+@router.message(F.text == "❓ Довідка")
+async def btn_help(m: Message):
+    await cmd_start(m)
 
 
 # ---------------------- CALLBACK-КНОПКИ ----------------------
