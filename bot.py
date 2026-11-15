@@ -1996,18 +1996,25 @@ async def on_message(m: Message, bot: Bot):
     )
     db.commit()
 
-    # Розпізнавання голосових повідомлень
-    if m.voice and get_setting(owner_id, "voice_transcribe_enabled"):
+    # Автоматичне розпізнавання голосових: текст повертається саме в той чат,
+    # у якому співрозмовник надіслав голосове повідомлення.
+    if m.voice:
         try:
             voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
             if voice_text:
                 await bot.send_message(
-                    owner_chat,
-                    contact_card(owner_id, m.chat.id, "Отримано голосове повідомлення") + "\n\n"
-                    f"🎙 Розпізнано ({html.escape(lang or '?')}):\n\n{html.escape(voice_text)}",
+                    m.chat.id,
+                    f"📝 Текст із голосового повідомлення:\n\n{html.escape(voice_text)}",
+                    business_connection_id=m.business_connection_id,
+                )
+            else:
+                await bot.send_message(
+                    m.chat.id,
+                    "Не вдалося розпізнати мовлення в цьому голосовому повідомленні.",
+                    business_connection_id=m.business_connection_id,
                 )
         except Exception as e:
-            logging.warning("Помилка розпізнавання голосового: %s", e)
+            logging.exception("Помилка розпізнавання голосового: %s", e)
 
     content = m.text or m.caption or ""
     # Пасивний антифрод: лише попереджає власника, не блокує повідомлення автоматично.
