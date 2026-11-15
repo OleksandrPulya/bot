@@ -529,12 +529,18 @@ def contact_card(owner_id: int, chat_id: int, action: str, details: str = "") ->
     name = html.escape(full_name or "Невідомо")
     uname = f"@{html.escape(username)}" if username else "Відсутній"
     uid = f"<code>{user_id}</code>" if user_id else "Невідомий (Telegram не передав ID користувача)"
-    lines = ["👤 <b>Інформація про користувача</b>", f"<b>Дія:</b> {html.escape(action)}",
-             f"<b>Ім'я:</b> {name}", f"<b>Username:</b> {uname}",
-             f"<b>User ID:</b> {uid}", f"<b>Chat ID:</b> <code>{chat_id}</code>"]
+
+    # Важливо: тут показуємо саме контакт, ДО ЯКОГО застосували команду,
+    # а не власника акаунта, який цю команду надіслав.
+    lines = [
+        "🎯 <b>Команду виконано для контакту:</b>",
+        f"<b>{name}</b> ({uname}) [ {uid} ]",
+        f"<b>Дія:</b> {html.escape(action)}",
+        f"<b>Chat ID:</b> <code>{chat_id}</code>",
+    ]
     if details:
         lines.append(f"<b>Деталі:</b> {html.escape(details)}")
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 
 async def notify_contact(bot: Bot, owner_chat: int, owner_id: int, chat_id: int,
