@@ -22,7 +22,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-TOKEN = "8318577133:AAHnzVUvVjjDIh3VCevLHRW7ldgIHkC8kgY"
+TOKEN = "9047816471:AAHihHyDrhRhJK324DnPtLmdpdfVF5dgPZU"
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
