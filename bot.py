@@ -138,6 +138,22 @@ CREATE TABLE IF NOT EXISTS tags(
 CREATE TABLE IF NOT EXISTS chat_activity(
     owner_id INTEGER, chat_id INTEGER, ts REAL, PRIMARY KEY(owner_id, chat_id));
 """)
+db.executescript("""
+CREATE TABLE IF NOT EXISTS contact_groups(
+ owner_id INTEGER, group_name TEXT, chat_id INTEGER,
+ PRIMARY KEY(owner_id, group_name, chat_id));
+CREATE TABLE IF NOT EXISTS deleted_archive(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, conn_id TEXT,
+ chat_id INTEGER, msg_id INTEGER, from_name TEXT, text TEXT,
+ media_type TEXT, file_id TEXT, from_id INTEGER, from_username TEXT,
+ deleted_at REAL);
+CREATE TABLE IF NOT EXISTS fraud_alerts(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER,
+ msg_id INTEGER, reason TEXT, content TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS backup_history(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, path TEXT,
+ created_at REAL, size_bytes INTEGER);
+""")
 db.commit()
 
 
@@ -394,7 +410,15 @@ HELP_PAGES = {
         "<code>/autotag слово мітка</code> — налаштувати автоматичне призначення мітки за словом; <code>/autotag off</code> вимикає.\n"
         "<code>/blocked</code> — переглянути список замучених контактів.\n"
         "<code>/daily</code> — показати підсумок подій за останні 24 години.\n"
-        "<code>/rules</code> — переглянути активні автоматичні правила."
+        "<code>/rules</code> — переглянути активні автоматичні правила.\n"
+        "<code>/history CHAT_ID [MESSAGE_ID]</code> — переглянути історію редагувань.\n"
+        "<code>/group</code> — керувати групами контактів.\n"
+        "<code>/contact CHAT_ID</code> — відкрити картку контакту.\n"
+        "<code>/dashboard</code> — відкрити панель керування.\n"
+        "<code>/archive</code> — переглянути архів видалених повідомлень.\n"
+        "<code>/smartremind HH:MM текст</code> — створити розумне нагадування.\n"
+        "<code>/fraud</code> — переглянути попередження про шахрайство.\n"
+        "<code>/backups</code> — переглянути історію резервних копій."
     ),
     "privacy": (
         "🔒 <b>Приватність і дані</b>\n\n"
@@ -697,7 +721,9 @@ async def ai_command(m: Message, mode: str):
             await m.answer("Використання: <code>/ai твоє запитання</code>")
             return
         prompt = arg
-        system = "Ти персональний асистент. Відповідай українською, чітко й коректно."
+        system = ("Ти розширений персональний асистент Telegram. Відповідай українською, "
+                  "структуровано й практично. Допомагай складати повідомлення в різних стилях, "
+                  "плани, списки дій, пояснення та підсумки. Не вигадуй факти; за нестачі даних уточнюй.")
     else:
         if not chat_id:
             await m.answer("Вкажи ID або частину назви контакту. Наприклад: <code>/summarize 123456789</code>")
@@ -1286,12 +1312,23 @@ async def cmd_backup(m: Message):
         db.execute("UPDATE settings SET auto_backup_enabled=? WHERE owner_id=?",(int(enabled),owner_id)); db.commit()
         await m.answer("🛡 Щотижневе резервне копіювання увімкнено. Копія надсилатиметься в понеділок." if enabled else "Автоматичне резервне копіювання вимкнено.")
         return
-    path=f"backup_{owner_id}_{int(time.time())}.db"
+    os.makedirs("backups", exist_ok=True)
+    path=os.path.join("backups", f"backup_{owner_id}_{int(time.time())}.db")
     target=sqlite3.connect(path)
     try: db.commit(); db.backup(target)
     finally: target.close()
-    await m.answer_document(FSInputFile(path),caption="🛡 Резервна копія бази даних. Зберігай файл у безпечному місці.")
-    os.remove(path)
+    size_bytes = os.path.getsize(path)
+    db.execute("INSERT INTO backup_history(owner_id,path,created_at,size_bytes) VALUES(?,?,?,?)",
+               (owner_id, path, time.time(), size_bytes)); db.commit()
+    # Залишаємо останні 5 записів історії на сервері; файл, який надсилаємо зараз, видаляємо після відправлення.
+    await m.answer_document(FSInputFile(path),caption=f"🛡 Резервна копія SQLite\nРозмір: {size_bytes:,} байт\nІсторія копій: /backups")
+    old = db.execute("SELECT id,path FROM backup_history WHERE owner_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 5", (owner_id,)).fetchall()
+    for old_id, old_path in old:
+        try:
+            if old_path and os.path.exists(old_path): os.remove(old_path)
+        except OSError: pass
+        db.execute("DELETE FROM backup_history WHERE id=?", (old_id,))
+    db.commit()
 
 @router.message(Command("restore"))
 async def cmd_restore(m: Message):
@@ -1329,6 +1366,10 @@ async def cmd_restore(m: Message):
             CREATE TABLE IF NOT EXISTS auto_rules(owner_id INTEGER,kind TEXT,value TEXT,enabled INTEGER DEFAULT 1,PRIMARY KEY(owner_id,kind));
             CREATE TABLE IF NOT EXISTS tags(owner_id INTEGER,chat_id INTEGER,tag TEXT,PRIMARY KEY(owner_id,chat_id));
             CREATE TABLE IF NOT EXISTS chat_activity(owner_id INTEGER,chat_id INTEGER,ts REAL,PRIMARY KEY(owner_id,chat_id));
+            CREATE TABLE IF NOT EXISTS contact_groups(owner_id INTEGER,group_name TEXT,chat_id INTEGER,PRIMARY KEY(owner_id,group_name,chat_id));
+            CREATE TABLE IF NOT EXISTS deleted_archive(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,conn_id TEXT,chat_id INTEGER,msg_id INTEGER,from_name TEXT,text TEXT,media_type TEXT,file_id TEXT,from_id INTEGER,from_username TEXT,deleted_at REAL);
+            CREATE TABLE IF NOT EXISTS fraud_alerts(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,chat_id INTEGER,msg_id INTEGER,reason TEXT,content TEXT,created_at REAL);
+            CREATE TABLE IF NOT EXISTS backup_history(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,path TEXT,created_at REAL,size_bytes INTEGER);
             """)
             for table,col,decl in [("settings","antiflood_limit","INTEGER DEFAULT 0"),("settings","autotranslate_enabled","INTEGER DEFAULT 0"),("settings","autotranslate_lang","TEXT DEFAULT 'uk'"),("settings","autonote_keyword","TEXT DEFAULT ''"),("settings","antispam_enabled","INTEGER DEFAULT 0"),("settings","vip_only","INTEGER DEFAULT 0"),("settings","auto_delete_hours","INTEGER DEFAULT 0"),("settings","auto_backup_enabled","INTEGER DEFAULT 0"),("settings","dnd_enabled","INTEGER DEFAULT 0"),("settings","dnd_start","TEXT DEFAULT '23:00'"),("settings","dnd_end","TEXT DEFAULT '08:00'"),("settings","autoreply_enabled","INTEGER DEFAULT 0"),("settings","autoreply_text","TEXT DEFAULT ''"),("settings","autoreply_start","TEXT DEFAULT ''"),("settings","autoreply_end","TEXT DEFAULT ''"),("settings","cleanup_days","INTEGER DEFAULT 30"),("settings","voice_transcribe_enabled","INTEGER DEFAULT 0"),("settings","weekly_report_enabled","INTEGER DEFAULT 0"),("muted","until","REAL"),("muted","chat_name","TEXT"),("scheduled_tasks","recurrence","TEXT"),("scheduled_tasks","weekday","INTEGER"),("scheduled_tasks","hhmm","TEXT"),("messages","from_id","INTEGER"),("messages","from_username","TEXT"),("messages","created_at","REAL DEFAULT 0"),("stats_log","chat_id","INTEGER")]:
                 ensure_column(table,col,decl)
@@ -1969,6 +2010,22 @@ async def on_message(m: Message, bot: Bot):
             logging.warning("Помилка розпізнавання голосового: %s", e)
 
     content = m.text or m.caption or ""
+    # Пасивний антифрод: лише попереджає власника, не блокує повідомлення автоматично.
+    if content:
+        fraud_patterns = [
+            (r"https?://[^\s]+", "Повідомлення містить посилання — перевір домен перед відкриттям"),
+            (r"(?i)(терміново|негайно).{0,50}(переказ|оплат|картк|парол|код)", "Терміновий запит грошей або платіжних даних"),
+            (r"(?i)(код підтвердження|код з sms|пароль|seed phrase|фразу відновлення)", "Запит коду, пароля або фрази відновлення"),
+            (r"(?i)(виграв|виграш|приз).{0,60}(оплат|комісі|посилан)", "Можлива шахрайська схема з призом або комісією"),
+        ]
+        for pattern, reason in fraud_patterns:
+            if re.search(pattern, content):
+                db.execute("INSERT INTO fraud_alerts(owner_id,chat_id,msg_id,reason,content,created_at) VALUES(?,?,?,?,?,?)",
+                           (owner_id, m.chat.id, m.message_id, reason, content[:2000], time.time()))
+                db.commit()
+                await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "⚠️ Можливий ризик шахрайства", reason) +
+                    "\n\n" + html.escape(content[:1500]) + "\n\nНе відкривай підозрілі посилання та не передавай коди/паролі.")
+                break
     # Автоматична нотатка за ключовим словом
     auto_note = get_setting_value(owner_id, "autonote_keyword") or ""
     if content and auto_note and auto_note.lower() in content.lower():
@@ -2204,6 +2261,12 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
                 await bot.send_message(owner_chat, body)
 
         db.execute(
+            "INSERT INTO deleted_archive(owner_id,conn_id,chat_id,msg_id,from_name,text,media_type,file_id,from_id,from_username,deleted_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (owner_id, d.business_connection_id, d.chat.id, msg_id,
+             row[0], row[1], row[2], row[3], row[4], row[5], time.time()),
+        )
+        db.execute(
             "DELETE FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=?",
             (d.business_connection_id, d.chat.id, msg_id),
         )
@@ -2397,6 +2460,105 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+
+# ---------------------- РОЗШИРЕНІ ФУНКЦІЇ ----------------------
+@router.message(Command("history"))
+async def cmd_history(m: Message):
+    parts=(m.text or "").split(maxsplit=1); owner=m.from_user.id
+    if len(parts)<2:
+        await m.answer("Формат: /history CHAT_ID [MESSAGE_ID]. Переглядає збережені версії повідомлень."); return
+    args=parts[1].split(); chat_id=int(args[0]) if args[0].isdigit() else None
+    if not chat_id:
+        row=db.execute("SELECT chat_id FROM chat_names WHERE owner_id=? AND name LIKE ? LIMIT 1",(owner,f"%{args[0]}%")).fetchone()
+        chat_id=row[0] if row else None
+    if not chat_id: await m.answer("Контакт не знайдено."); return
+    if len(args)>1 and args[1].isdigit():
+        rows=db.execute("SELECT text,created_at FROM message_versions WHERE chat_id=? AND msg_id=? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?) ORDER BY created_at",(chat_id,int(args[1]),owner)).fetchall()
+    else:
+        rows=db.execute("SELECT msg_id,text,created_at FROM message_versions WHERE chat_id=? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?) ORDER BY created_at DESC LIMIT 30",(chat_id,owner)).fetchall()
+        lines=[f"#{mid} · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M:%S')} · {html.escape((txt or '[медіа]')[:180])}" for mid,txt,ts in rows]
+        await m.answer("🕘 <b>Останні збережені версії</b>\n\n"+("\n".join(lines) if lines else "Історія порожня.")+"\n\nДля всіх версій: /history CHAT_ID MESSAGE_ID"); return
+    lines=[f"<b>Версія {i}</b> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M:%S')}\n<blockquote>{html.escape(txt or '[медіа]')}</blockquote>" for i,(txt,ts) in enumerate(rows,1)]
+    await m.answer("🕘 <b>Історія редагувань</b>\n\n"+("\n\n".join(lines) if lines else "Версій не знайдено."))
+
+@router.message(Command("group"))
+async def cmd_group(m: Message):
+    parts=(m.text or "").split(maxsplit=2); owner=m.from_user.id
+    if len(parts)<2:
+        rows=db.execute("SELECT group_name,COUNT(*) FROM contact_groups WHERE owner_id=? GROUP BY group_name ORDER BY group_name",(owner,)).fetchall()
+        await m.answer("👥 <b>Групи контактів</b>\n\n"+("\n".join(f"• {html.escape(n)} — {c}" for n,c in rows) if rows else "Груп поки немає.")+"\n\n/group add НАЗВА CHAT_ID\n/group list НАЗВА\n/group del НАЗВА CHAT_ID"); return
+    action=parts[1].lower()
+    if action=="add" and len(parts)==3:
+        bits=parts[2].rsplit(maxsplit=1)
+        if len(bits)!=2 or not bits[1].lstrip('-').isdigit(): await m.answer("Формат: /group add НАЗВА CHAT_ID"); return
+        db.execute("INSERT OR IGNORE INTO contact_groups VALUES(?,?,?)",(owner,bits[0],int(bits[1]))); db.commit(); await m.answer("✅ Контакт додано до групи.")
+    elif action=="del" and len(parts)==3:
+        bits=parts[2].rsplit(maxsplit=1)
+        if len(bits)!=2 or not bits[1].lstrip('-').isdigit(): await m.answer("Формат: /group del НАЗВА CHAT_ID"); return
+        db.execute("DELETE FROM contact_groups WHERE owner_id=? AND group_name=? AND chat_id=?",(owner,bits[0],int(bits[1]))); db.commit(); await m.answer("Контакт вилучено з групи.")
+    elif action=="list" and len(parts)==3:
+        rows=db.execute("SELECT g.chat_id,COALESCE(c.name,g.chat_id) FROM contact_groups g LEFT JOIN chat_names c ON c.owner_id=g.owner_id AND c.chat_id=g.chat_id WHERE g.owner_id=? AND g.group_name=?",(owner,parts[2])).fetchall()
+        await m.answer(f"👥 <b>{html.escape(parts[2])}</b>\n\n"+("\n".join(f"• {html.escape(str(name))} — <code>{cid}</code>" for cid,name in rows) if rows else "Група порожня."))
+    else: await m.answer("Команди: /group add НАЗВА CHAT_ID, /group list НАЗВА, /group del НАЗВА CHAT_ID")
+
+@router.message(Command("contact"))
+async def cmd_contact(m: Message):
+    parts=(m.text or "").split(maxsplit=1)
+    if len(parts)<2: await m.answer("Формат: /contact CHAT_ID"); return
+    arg=parts[1].strip(); owner=m.from_user.id
+    row=db.execute("SELECT chat_id FROM chat_names WHERE owner_id=? AND name LIKE ? LIMIT 1",(owner,f"%{arg}%")).fetchone() if not arg.lstrip('-').isdigit() else None
+    cid=row[0] if row else (int(arg) if arg.lstrip('-').isdigit() else None)
+    if not cid: await m.answer("Контакт не знайдено."); return
+    name,uid,username,url=stats_contact_link(owner,cid)
+    counts={e:db.execute("SELECT COUNT(*) FROM stats_log WHERE owner_id=? AND chat_id=? AND event=?",(owner,cid,e)).fetchone()[0] for e in ("received","edited","deleted")}
+    tags=db.execute("SELECT tag FROM tags WHERE owner_id=? AND chat_id=?",(owner,cid)).fetchone()
+    groups=db.execute("SELECT group_name FROM contact_groups WHERE owner_id=? AND chat_id=?",(owner,cid)).fetchall()
+    last=db.execute("SELECT text,created_at FROM messages WHERE chat_id=? AND conn_id IN (SELECT conn_id FROM connections WHERE owner_id=?) ORDER BY created_at DESC LIMIT 1",(cid,owner)).fetchone()
+    link=f'\n<a href="{html.escape(url,quote=True)}">Відкрити профіль</a>' if url else ""
+    await m.answer(f"👤 <b>Картка контакту</b>\n\n<b>{html.escape(str(name))}</b>\nID: <code>{uid or cid}</code>\nUsername: @{html.escape(username or 'невідомий')}\nПовідомлень: {counts['received']}\nРедагувань: {counts['edited']}\nВидалень: {counts['deleted']}\nМітка: {html.escape(tags[0] if tags else 'немає')}\nГрупи: {html.escape(', '.join(x[0] for x in groups) or 'немає')}\nОстаннє повідомлення: {html.escape((last[0] or '[медіа]')[:500] if last else 'немає')}"+link)
+
+@router.message(Command("dashboard"))
+async def cmd_dashboard(m: Message):
+    owner=m.from_user.id
+    contacts=db.execute("SELECT COUNT(*) FROM contacts WHERE owner_id=?",(owner,)).fetchone()[0]
+    groups=db.execute("SELECT COUNT(DISTINCT group_name) FROM contact_groups WHERE owner_id=?",(owner,)).fetchone()[0]
+    tasks=db.execute("SELECT COUNT(*) FROM scheduled_tasks WHERE owner_id=? AND done=0",(owner,)).fetchone()[0]
+    archived=db.execute("SELECT COUNT(*) FROM deleted_archive WHERE owner_id=?",(owner,)).fetchone()[0]
+    fraud=db.execute("SELECT COUNT(*) FROM fraud_alerts WHERE owner_id=?",(owner,)).fetchone()[0]
+    await m.answer(f"🧭 <b>Панель керування</b>\n\n👥 Контактів: <b>{contacts}</b>\n📁 Груп контактів: <b>{groups}</b>\n⏰ Активних завдань: <b>{tasks}</b>\n🗑 В архіві видалень: <b>{archived}</b>\n⚠️ Попереджень безпеки: <b>{fraud}</b>\n\n/history CHAT_ID — історія версій\n/group — групи контактів\n/contact CHAT_ID — картка контакту\n/archive — архів видалених\n/fraud — попередження безпеки\n/backups — історія резервних копій")
+
+@router.message(Command("archive"))
+async def cmd_archive(m: Message):
+    parts=(m.text or "").split(maxsplit=1); owner=m.from_user.id
+    rows=db.execute("SELECT id,chat_id,msg_id,from_name,text,media_type,deleted_at FROM deleted_archive WHERE owner_id=? ORDER BY deleted_at DESC LIMIT 20",(owner,)).fetchall()
+    if len(parts)>1 and parts[1].strip().lower()=="clear":
+        db.execute("DELETE FROM deleted_archive WHERE owner_id=?",(owner,)); db.commit(); await m.answer("Архів видалених повідомлень очищено."); return
+    lines=[f"#{i} · {html.escape(str(name or 'Невідомо'))} · чат <code>{cid}</code> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')}\n{html.escape((txt or f'[{mt or 'медіа'}]')[:220])}" for i,cid,mid,name,txt,mt,ts in rows]
+    await m.answer("🗑 <b>Архів видалених повідомлень</b>\n\n"+("\n\n".join(lines) if lines else "Архів порожній.")+"\n\n/archive clear — очистити архів")
+
+@router.message(Command("smartremind"))
+async def cmd_smartremind(m: Message):
+    parts=(m.text or "").split(maxsplit=1)
+    if len(parts)<2: await m.answer("Формат: /smartremind HH:MM текст або /smartremind завтра HH:MM текст"); return
+    raw=parts[1].strip(); day_offset=0
+    if raw.lower().startswith("завтра "): day_offset=1; raw=raw[7:]
+    bits=raw.split(maxsplit=1)
+    if len(bits)<2 or not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d",bits[0]): await m.answer("Вкажи час у форматі HH:MM і текст нагадування."); return
+    hh,mm=map(int,bits[0].split(':')); run=(datetime.now()+timedelta(days=day_offset)).replace(hour=hh,minute=mm,second=0,microsecond=0)
+    if run.timestamp()<=time.time(): await m.answer("Цей час уже минув. Вкажи майбутній час."); return
+    db.execute("INSERT INTO scheduled_tasks(owner_id,chat_id,conn_id,type,run_at,payload,done) VALUES(?,?,NULL,'reminder',?,?,0)",(m.from_user.id,m.chat.id,run.timestamp(),bits[1])); db.commit()
+    await m.answer(f"🧠 Розумне нагадування створено на {run.strftime('%d.%m о %H:%M')}: {html.escape(bits[1])}")
+
+@router.message(Command("fraud"))
+async def cmd_fraud(m: Message):
+    rows=db.execute("SELECT chat_id,reason,content,created_at FROM fraud_alerts WHERE owner_id=? ORDER BY created_at DESC LIMIT 15",(m.from_user.id,)).fetchall()
+    await m.answer("🛡 <b>Попередження про можливе шахрайство</b>\n\n"+("\n\n".join(f"Чат <code>{cid}</code> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')}\n<b>{html.escape(reason)}</b>\n{html.escape((content or '')[:300])}" for cid,reason,content,ts in rows) if rows else "Підозрілих повідомлень не зафіксовано.")+"\n\nЦе евристичні попередження, не гарантоване визначення шахрайства.")
+
+@router.message(Command("backups"))
+async def cmd_backups(m: Message):
+    rows=db.execute("SELECT created_at,size_bytes FROM backup_history WHERE owner_id=? ORDER BY created_at DESC LIMIT 10",(m.from_user.id,)).fetchall()
+    await m.answer("💾 <b>Історія резервних копій</b>\n\n"+("\n".join(f"{datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M')} — {size:,} байт" for ts,size in rows) if rows else "Копій ще не створювали.")+"\n\n/backup — створити нову копію\n/backup auto — щотижневе копіювання")
+
 
 # ЗАПУСК
 async def main():
