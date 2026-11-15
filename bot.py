@@ -46,7 +46,7 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -1943,6 +1943,23 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             pass
 
 
+# Звичайні приватні чати з ботом: відповідаємо текстом на отримане голосове.
+@router.message(F.voice)
+async def on_private_voice(m: Message, bot: Bot):
+    status = await m.answer("🎙 Розпізнаю голосове повідомлення…")
+    try:
+        voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
+        if voice_text:
+            await status.edit_text(
+                "📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)
+            )
+        else:
+            await status.edit_text("Не вдалося розпізнати мовлення. Спробуй надіслати голосове ще раз, чіткіше й без сильного шуму.")
+    except Exception:
+        logging.exception("Помилка розпізнавання голосового в приватному чаті")
+        await status.edit_text("Не вдалося обробити голосове. Перевір, чи встановлено faster-whisper і чи Render має доступ до завантаження моделі.")
+
+
 # ---------------------- BUSINESS-ПОДІЇ ----------------------
 @router.business_connection()
 async def on_connection(c: BusinessConnection, bot: Bot):
@@ -1973,6 +1990,19 @@ async def on_message(m: Message, bot: Bot):
         await handle_owner_command(m, bot, owner_id, owner_chat)
         return
 
+    # Автоматичне розпізнавання голосових у бізнес-чаті.
+    if m.voice:
+        try:
+            voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
+            reply = ("📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)) if voice_text else "Не вдалося розпізнати мовлення в цьому голосовому повідомленні."
+            await bot.send_message(m.chat.id, reply, business_connection_id=m.business_connection_id)
+        except Exception:
+            logging.exception("Помилка розпізнавання голосового в бізнес-чаті")
+            try:
+                await bot.send_message(m.chat.id, "Не вдалося обробити голосове повідомлення. Перевірте журнал Render.", business_connection_id=m.business_connection_id)
+            except Exception:
+                logging.exception("Не вдалося надіслати повідомлення про помилку розпізнавання")
+
     remember_contact(owner_id, m)
 
     if db.execute(
@@ -1995,26 +2025,6 @@ async def on_message(m: Message, bot: Bot):
         (owner_id, "received", time.time(), m.chat.id),
     )
     db.commit()
-
-    # Автоматичне розпізнавання голосових: текст повертається саме в той чат,
-    # у якому співрозмовник надіслав голосове повідомлення.
-    if m.voice:
-        try:
-            voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
-            if voice_text:
-                await bot.send_message(
-                    m.chat.id,
-                    f"📝 Текст із голосового повідомлення:\n\n{html.escape(voice_text)}",
-                    business_connection_id=m.business_connection_id,
-                )
-            else:
-                await bot.send_message(
-                    m.chat.id,
-                    "Не вдалося розпізнати мовлення в цьому голосовому повідомленні.",
-                    business_connection_id=m.business_connection_id,
-                )
-        except Exception as e:
-            logging.exception("Помилка розпізнавання голосового: %s", e)
 
     content = m.text or m.caption or ""
     # Пасивний антифрод: лише попереджає власника, не блокує повідомлення автоматично.
