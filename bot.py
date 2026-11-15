@@ -46,7 +46,10 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        # tiny — найшвидша багатомовна модель; int8 зменшує навантаження на CPU/RAM.
+        _whisper_model = WhisperModel(
+            "tiny", device="cpu", compute_type="int8", cpu_threads=2, num_workers=1
+        )
     return _whisper_model
 
 
@@ -57,12 +60,23 @@ async def transcribe_voice(bot: Bot, file_id: str):
 
     def _run():
         model = get_whisper_model()
-        segments, info = model.transcribe(tmp_path, language=None, vad_filter=True)
+        segments, info = model.transcribe(
+            tmp_path,
+            language=None,
+            task="transcribe",
+            beam_size=1,
+            best_of=1,
+            temperature=0,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 400},
+        )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         return text, info.language
 
     try:
-        text, lang = await asyncio.to_thread(_run)
+        # Жорсткий ліміт: модель + розпізнавання мають завершитися за 30 секунд.
+        text, lang = await asyncio.wait_for(asyncio.to_thread(_run), timeout=30)
     finally:
         try:
             os.remove(tmp_path)
@@ -487,6 +501,30 @@ def get_conn(conn_id: str):
     return db.execute(
         "SELECT owner_id, owner_chat_id FROM connections WHERE conn_id=?", (conn_id,)
     ).fetchone()
+
+
+async def resolve_business_connection(bot: Bot, conn_id: str):
+    """Recover the owner mapping from Telegram if the local SQLite row was lost."""
+    conn = get_conn(conn_id)
+    if conn:
+        return conn
+    try:
+        business = await bot.get_business_connection(conn_id)
+        if not business or not business.is_enabled:
+            logging.warning("Business connection %s is missing or disabled", conn_id)
+            return None
+        owner_id = business.user.id
+        owner_chat_id = business.user_chat_id
+        db.execute(
+            "INSERT OR REPLACE INTO connections(conn_id, owner_id, owner_chat_id) VALUES(?,?,?)",
+            (conn_id, owner_id, owner_chat_id),
+        )
+        db.commit()
+        logging.info("Recovered business connection %s for owner %s", conn_id, owner_id)
+        return owner_id, owner_chat_id
+    except Exception:
+        logging.exception("Could not recover business connection %s from Telegram", conn_id)
+        return None
 
 
 def is_muted(owner_id: int, chat_id: int) -> bool:
@@ -1946,7 +1984,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
 # Звичайні приватні чати з ботом: відповідаємо текстом на отримане голосове.
 @router.message(F.voice)
 async def on_private_voice(m: Message, bot: Bot):
-    status = await m.answer("🎙 Розпізнаю голосове повідомлення…")
+    status = await m.answer("🎙 Отримав голосове. Завантажую модель і розпізнаю мовлення…")
     try:
         voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
         if voice_text:
@@ -1954,10 +1992,13 @@ async def on_private_voice(m: Message, bot: Bot):
                 "📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)
             )
         else:
-            await status.edit_text("Не вдалося розпізнати мовлення. Спробуй надіслати голосове ще раз, чіткіше й без сильного шуму.")
-    except Exception:
+            await status.edit_text("Не вдалося розпізнати мовлення. Спробуй надіслати голосове чіткіше й без сильного шуму.")
+    except asyncio.TimeoutError:
+        logging.error("Whisper timeout while transcribing private voice message")
+        await status.edit_text("⏳ Не вдалося розпізнати голосове за 30 секунд. Спробуй коротше повідомлення або повтори трохи пізніше.")
+    except Exception as e:
         logging.exception("Помилка розпізнавання голосового в приватному чаті")
-        await status.edit_text("Не вдалося обробити голосове. Перевір, чи встановлено faster-whisper і чи Render має доступ до завантаження моделі.")
+        await status.edit_text("⚠️ Не вдалося обробити голосове: " + html.escape(str(e)[:350]))
 
 
 # ---------------------- BUSINESS-ПОДІЇ ----------------------
@@ -1981,8 +2022,9 @@ async def on_connection(c: BusinessConnection, bot: Bot):
 
 @router.business_message()
 async def on_message(m: Message, bot: Bot):
-    conn = get_conn(m.business_connection_id)
+    conn = await resolve_business_connection(bot, m.business_connection_id)
     if not conn:
+        logging.warning("Ignoring business message: no owner mapping for connection %s", m.business_connection_id)
         return
     owner_id, owner_chat = conn
 
@@ -1990,16 +2032,39 @@ async def on_message(m: Message, bot: Bot):
         await handle_owner_command(m, bot, owner_id, owner_chat)
         return
 
-    # Автоматичне розпізнавання голосових у бізнес-чаті.
+    # Автоматичне розпізнавання голосових у чатах, підключених через Telegram Business.
     if m.voice:
+        progress = None
         try:
+            progress = await bot.send_message(
+                m.chat.id, "🎙 Розпізнаю голосове повідомлення…",
+                business_connection_id=m.business_connection_id,
+            )
             voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
             reply = ("📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)) if voice_text else "Не вдалося розпізнати мовлення в цьому голосовому повідомленні."
-            await bot.send_message(m.chat.id, reply, business_connection_id=m.business_connection_id)
-        except Exception:
+            await bot.edit_message_text(
+                reply, chat_id=m.chat.id, message_id=progress.message_id,
+                business_connection_id=m.business_connection_id,
+            )
+        except asyncio.TimeoutError:
+            logging.error("Whisper timeout while transcribing business voice message")
+            if progress:
+                await bot.edit_message_text(
+                    "⏳ Не вдалося розпізнати голосове за 30 секунд. Спробуй коротше повідомлення або повтори трохи пізніше.",
+                    chat_id=m.chat.id, message_id=progress.message_id,
+                    business_connection_id=m.business_connection_id,
+                )
+        except Exception as e:
             logging.exception("Помилка розпізнавання голосового в бізнес-чаті")
             try:
-                await bot.send_message(m.chat.id, "Не вдалося обробити голосове повідомлення. Перевірте журнал Render.", business_connection_id=m.business_connection_id)
+                error_text = "⚠️ Не вдалося обробити голосове: " + html.escape(str(e)[:300])
+                if progress:
+                    await bot.edit_message_text(
+                        error_text, chat_id=m.chat.id, message_id=progress.message_id,
+                        business_connection_id=m.business_connection_id,
+                    )
+                else:
+                    await bot.send_message(m.chat.id, error_text, business_connection_id=m.business_connection_id)
             except Exception:
                 logging.exception("Не вдалося надіслати повідомлення про помилку розпізнавання")
 
