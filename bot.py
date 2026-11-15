@@ -1547,10 +1547,9 @@ import os
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot is running")
+    return web.Response(text="Bot is alive")
 
-async def main():
-    # Запуск легкого вебсервера для Render
+async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -1559,5 +1558,14 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # Запуск вашого бота (залиште ваш рядок запуску polling тут)
+async def main():
+    # Спочатку запускаємо вебсервер у фоні, щоб Render побачив відкритий порт
+    await start_web_server()
+    
+    # Якщо у вас тут були інші рядки перед polling (наприклад, видалення вебхука чи створення таблиць БД), залиште їх тут
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
