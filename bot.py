@@ -312,7 +312,7 @@ HELP_PAGES = {
         "• Якщо сервер або бот вимкнений, події та заплановані дії можуть бути пропущені."
     ),
     "cmds": (
-        "📌 <b>Як користуватися командами</b>\n"
+        "📌 <b>Як користуватися командами</b>\n\n"
         "Команди з ! надсилай у відповідному особистому чаті від свого імені. Команди зі / надсилай безпосередньо цьому боту.\n\n"
         "<b>🔇 Команди в особистих чатах</b>\n\n"
         "<code>!мут</code> — додати контакт до списку замучених без обмеження часу.\n"
@@ -342,7 +342,7 @@ HELP_PAGES = {
         "<code>!дозволити</code> — додати поточний контакт до списку дозволених.\n"
         "<code>!заборонити</code> — прибрати поточний контакт зі списку дозволених.\n"
         "<code>!антиспам</code> — увімкнути або вимкнути фільтр повторюваних однакових повідомлень.\n\n"
-        "\n<b>🤖 Команди в чаті з ботом</b>\n\n"
+        "<b>🤖 Команди в чаті з ботом</b>\n\n"
         "<code>/start</code> — відкрити головне меню та привітання.\n"
         "<code>/help</code> — показати довідку та меню.\n"
         "<code>/settings</code> — відкрити інтерактивні налаштування.\n"
@@ -846,7 +846,7 @@ def tasks_keyboard(owner_id: int):
 # ---------------------- МЕНЮ В ЧАТІ З БОТОМ ----------------------
 @router.message(Command("start", "help"))
 async def cmd_start(m: Message):
-    await m.answer(WELCOME, reply_markup=main_menu())
+    await m.answer(WELCOME, reply_markup=main_reply_keyboard())
 
 
 @router.message(Command("settings"))
@@ -1448,11 +1448,6 @@ async def btn_menu(m: Message):
     await cmd_start(m)
 
 
-@router.message(F.text == "🛠 Налаштування")
-async def btn_settings(m: Message):
-    await cmd_settings(m)
-
-
 @router.message(F.text == "📊 Статистика")
 async def btn_stats(m: Message):
     await cmd_stats(m)
@@ -1466,11 +1461,6 @@ async def btn_notes(m: Message):
 @router.message(F.text == "📋 Завдання")
 async def btn_tasks(m: Message):
     await cmd_tasks(m)
-
-
-@router.message(F.text == "❓ Довідка")
-async def btn_help(m: Message):
-    await cmd_start(m)
 
 
 # ---------------------- CALLBACK-КНОПКИ ----------------------
