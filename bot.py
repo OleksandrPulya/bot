@@ -1529,20 +1529,6 @@ async def scheduler_loop(bot: Bot):
 
 
 # ---------------------- ЗАПУСК ----------------------
-async def main():
-    global BOT_USERNAME
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    me = await bot.me()
-    BOT_USERNAME = me.username
-    dp = Dispatcher()
-    dp.include_router(router)
-    asyncio.create_task(scheduler_loop(bot))
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
 import os
 from aiohttp import web
 
@@ -1558,14 +1544,17 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+# ЗАПУСК
 async def main():
-    # Спочатку запускаємо вебсервер у фоні, щоб Render побачив відкритий порт
+    global BOT_USERNAME
     await start_web_server()
-    
-    # Якщо у вас тут були інші рядки перед polling (наприклад, видалення вебхука чи створення таблиць БД), залиште їх тут
-    await bot.delete_webhook(drop_pending_updates=True)
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    me = await bot.me()
+    BOT_USERNAME = me.username
+    dp = Dispatcher()
+    dp.include_router(router)
+    asyncio.create_task(scheduler_loop(bot))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
