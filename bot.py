@@ -527,20 +527,29 @@ def contact_card(owner_id: int, chat_id: int, action: str, details: str = "") ->
         user_id, username = None, None
         full_name = get_chat_display_name(owner_id, chat_id)
     name = html.escape(full_name or "Невідомо")
-    uname = f"@{html.escape(username)}" if username else "Відсутній"
     uid = f"<code>{user_id}</code>" if user_id else "Невідомий (Telegram не передав ID користувача)"
 
-    # Важливо: тут показуємо саме контакт, ДО ЯКОГО застосували команду,
-    # а не власника акаунта, який цю команду надіслав.
+    # Посилання розміщене безпосередньо на імені контакту.
+    # Якщо Telegram передав ID — відкриваємо профіль через tg://user?id=...
+    # Якщо ID немає, але є username — використовуємо посилання t.me.
+    if user_id:
+        clickable_name = f'<a href="tg://user?id={int(user_id)}"><b>{name}</b></a>'
+    elif username:
+        safe_username = html.escape(str(username).lstrip("@"), quote=True)
+        clickable_name = f'<a href="https://t.me/{safe_username}"><b>{name}</b></a>'
+    else:
+        clickable_name = f"<b>{name}</b>"
+
+    # Показуємо саме контакт, ДО ЯКОГО застосували команду.
     lines = [
         "🎯 <b>Команду виконано для контакту:</b>",
-        f"<b>{name}</b> ({uname}) [ {uid} ]",
+        f"{clickable_name} [ {uid} ]",
         f"<b>Дія:</b> {html.escape(action)}",
         f"<b>Chat ID:</b> <code>{chat_id}</code>",
     ]
     if details:
         lines.append(f"<b>Деталі:</b> {html.escape(details)}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 async def notify_contact(bot: Bot, owner_chat: int, owner_id: int, chat_id: int,
