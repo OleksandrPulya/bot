@@ -264,36 +264,35 @@ def in_time_window(start: str, end: str) -> bool:
 # ---------------------- ТЕКСТИ ІНСТРУКЦІЙ ----------------------
 HELP_PAGES = {
     "connect": (
-        "📖 <b>Як підключити бота</b>\n\n"
-        "Перед початком відкрий чат із ботом і натисни <b>/start</b>. "
-        "Підключення виконується через Telegram Business — потрібен акаунт із доступом до цієї функції.\n\n"
+        "📖 <b>Як підключити бота до профілю</b>\n\n"
+        "Підключення виконується через функцію Telegram <b>«Автоматизація чатів» (Chat Automation)</b> у налаштуваннях профілю. "
+        "Відкрий чат із ботом і натисни <b>/start</b>, а потім виконай кроки нижче.\n\n"
         "<b>📱 iPhone / iOS</b>\n"
-        "1. Відкрий Telegram і перейди в <b>Налаштування</b>.\n"
-        "2. Відкрий <b>Telegram Business</b> (або розділ Business у налаштуваннях акаунта).\n"
-        "3. Обери <b>Чат-боти</b> та натисни «Додати бота».\n"
-        "4. Введи <code>@{bot_username}</code> і вибери його зі списку.\n"
-        "5. Визнач, до яких особистих чатів бот матиме доступ, і налаштуй дозволи на повідомлення та видалення.\n"
-        "6. Збережи налаштування.\n\n"
+        "1. Відкрий Telegram → <b>Налаштування</b>.\n"
+        "2. Знайди розділ <b>Автоматизація чатів / Chat Automation</b>.\n"
+        "3. Натисни «Підключити бота» та знайди <code>@{bot_username}</code>.\n"
+        "4. Вибери, до яких чатів бот матиме доступ (наприклад, нові чати або вибрані контакти).\n"
+        "5. Переглянь дозволи та підтверди підключення.\n\n"
         "<b>🤖 Android</b>\n"
         "1. Відкрий Telegram → меню ☰ → <b>Налаштування</b>.\n"
-        "2. Перейди до <b>Telegram Business</b> → <b>Чат-боти</b>.\n"
-        "3. Натисни «Додати бота» та знайди <code>@{bot_username}</code>.\n"
-        "4. Вибери чати, до яких дозволяєш доступ, і потрібні дозволи.\n"
-        "5. Підтверди підключення.\n\n"
-        "<b>💻 Desktop</b>\n"
-        "1. Відкрий Telegram Desktop і зайди в <b>Налаштування</b>.\n"
-        "2. Відкрий <b>Telegram Business</b> → <b>Чат-боти</b> (якщо цей пункт доступний у твоїй версії).\n"
-        "3. Додай <code>@{bot_username}</code>, вибери дозволені чати та права.\n"
-        "4. Підтверди зміни. Якщо розділу немає, онови Telegram або виконай підключення з офіційного мобільного застосунку.\n\n"
-        "<b>Важливо:</b> назви пунктів можуть трохи відрізнятися залежно від версії Telegram, мови та доступності Telegram Business. "
-        "Самого натискання /start недостатньо — потрібно окремо надати боту доступ у налаштуваннях Telegram Business."
+        "2. Перейди до <b>Автоматизація чатів / Chat Automation</b>.\n"
+        "3. Натисни «Підключити бота» та вибери <code>@{bot_username}</code>.\n"
+        "4. Налаштуй список чатів, яким дозволено доступ, і підтверди підключення.\n\n"
+        "<b>💻 Telegram Desktop</b>\n"
+        "1. Відкрий Telegram Desktop → <b>Налаштування</b>.\n"
+        "2. Знайди <b>Автоматизація чатів / Chat Automation</b> (наявність пункту залежить від версії клієнта).\n"
+        "3. Вибери бота <code>@{bot_username}</code>, налаштуй доступ до чатів і підтверди.\n"
+        "4. Якщо пункту немає, онови Telegram або виконай підключення в офіційному застосунку на телефоні.\n\n"
+        "<b>Важливо:</b> у BotFather для бота має бути ввімкнений режим <b>Secretary Mode</b> / можливість підключення до профілю. "
+        "Після успішного підключення бот отримає подію з'єднання. Саме відкриття чату з ботом або натискання /start не надає доступу до інших чатів.\n"
+        "Керувати доступом або відключити бота можна в тому самому розділі <b>Автоматизація чатів</b>."
     ),
     "how": (
         "⚙️ <b>Можливості бота</b>\n\n"
-        "Після підключення до Telegram Business бот може виконувати такі дії:\n\n"
+        "Після підключення бота до профілю через «Автоматизацію чатів» він може обробляти повідомлення з дозволених особистих чатів:\n\n"
         "✏️ <b>Контроль редагувань:</b> надсилає старий і новий текст повідомлення; якщо воно редагувалося кілька разів, показує збережені попередні версії.\n"
         "🗑 <b>Контроль видалень:</b> зберігає копії отриманих повідомлень і повідомляє, коли вони видаляються; за ввімкненого параметра може пересилати збережені медіафайли.\n"
-        "🔇 <b>Мут контактів:</b> приховує сповіщення від вибраного контакту, видаляючи його нові повідомлення через Business API; можна задати строк або вимкнути мут вручну.\n"
+        "🔇 <b>Мут контактів:</b> приховує сповіщення від вибраного контакту, видаляючи його нові повідомлення через підключення до профілю; можна задати строк або вимкнути мут вручну.\n"
         "⭐ <b>VIP-контакти:</b> позначає важливих співрозмовників, чиї сповіщення проходять крізь режим «Не турбувати».\n"
         "🌙 <b>Фільтрація сповіщень:</b> тихий режим, режим лише VIP, ігнорування чатів та список дозволених контактів.\n"
         "🔑 <b>Ключові слова:</b> шукає задані слова у вхідних текстах і надсилає сповіщення; для слова можна задати чати, де воно діє або ігнорується.\n"
@@ -409,7 +408,7 @@ HELP_PAGES = {
     "privacy": (
         "🔒 <b>Приватність і дані</b>\n\n"
         "<b>Які дані зберігаються</b>\n"
-        "• Дані підключення Telegram Business: ідентифікатор підключення, ID власника та ID чату для надсилання сповіщень.\n"
+        "• Дані підключення бота до профілю: ідентифікатор підключення, ID власника та ID чату для надсилання сповіщень.\n"
         "• Повідомлення з підключених чатів: текст або підпис, тип медіа, Telegram file_id, дата/час, ID та ім'я відправника, username, ID чату й повідомлення.\n"
         "• Попередні версії відредагованих повідомлень — щоб можна було показати історію змін.\n"
         "• Контакти та назви чатів, мітки, список VIP, замучені/ігноровані/дозволені чати.\n"
@@ -420,13 +419,13 @@ HELP_PAGES = {
         "• Дані зберігаються у файлі SQLite <code>bot.db</code> на сервері, де запущений бот. У цьому коді база не шифрується; безпека залежить від захисту сервера, резервних копій і доступу до файлів.\n"
         "• Бот надсилає власнику сповіщення та копії подій у приватний чат із ботом. Експорт і резервні копії надсилаються лише на запит або за ввімкненого автоматичного резервування.\n"
         "• Якщо використовуються <code>/ai</code>, <code>/summarize</code>, <code>/reply</code>, <code>/translate</code>, <code>/explain</code>, <code>/sentiment</code> або семантичний пошук, вибраний текст переписки передається до OpenAI API. Автопереклад також передає текст зовнішньому сервісу, якщо ця функція реалізована та ввімкнена у розгорнутій версії.\n"
-        "• Telegram обробляє повідомлення та Business-підключення відповідно до власної політики приватності й налаштувань сервісу.\n\n"
+        "• Telegram обробляє повідомлення та підключення бота до профілю відповідно до власної політики приватності й налаштувань сервісу.\n\n"
         "<b>Що бот не робить</b>\n"
         "• Не має доступу до всієї старої історії до моменту підключення.\n"
         "• Не отримує автоматично пароль Telegram або код входу.\n"
         "• Сам файл бази даних не публікується, але адміністратор сервера, де працює бот, технічно може мати доступ до нього.\n\n"
         "<b>Керування та видалення</b>\n"
-        "• Вимкни доступ у Telegram: <b>Налаштування → Telegram Business → Чат-боти</b> та видали/відключи цього бота. Це припинить надходження нових подій, але не видалить уже збережену базу.\n"
+        "• Вимкни доступ у Telegram: <b>Налаштування → Автоматизація чатів / Chat Automation</b> та видали/відключи цього бота. Це припинить надходження нових подій, але не видалить уже збережену базу.\n"
         "• Команда <code>!очиститиісторію</code> видаляє локальну історію конкретного чату.\n"
         "• Кнопка «Видалити збережені копії» у цьому розділі видаляє з бази повідомлення та їхні версії для всіх підключених чатів; інші дані (нотатки, налаштування, журнали, контакти, завдання тощо) вона не видаляє.\n"
         "• <code>/cleanup</code> задає строк зберігання історії; автоматичне очищення видаляє старі повідомлення та версії, але не всі інші категорії даних.\n"
@@ -438,13 +437,13 @@ HELP_PAGES = {
 }
 
 WELCOME = (
-    "👋 <b>Привіт! Я — персональний Telegram Business-бот для контролю та автоматизації особистих чатів.</b>\n\n"
+    "👋 <b>Привіт! Я — персональний Telegram-бот для контролю та автоматизації дозволених особистих чатів.</b>\n\n"
     "Я можу повідомляти про редагування й видалення повідомлень, зберігати їхні копії, "
     "відстежувати ключові слова, керувати сповіщеннями та VIP-контактами, застосовувати мут, "
     "створювати нагадування й відкладені повідомлення, вести нотатки та шаблони, "
     "формувати статистику й звіти, експортувати історію, а також використовувати функції ШІ, "
     "перекладу, антиспаму й автоматизації — якщо відповідні модулі налаштовані.\n\n"
-    "Для початку відкрий «Як підключити» та надай боту доступ у Telegram Business. "
+    "Для початку відкрий «Як підключити» та підключи його в розділі «Автоматизація чатів / Chat Automation». "
     "У розділі «Команди» є повний перелік команд і пояснення, а в «Налаштуваннях» більшість "
     "основних перемикачів доступна кнопками.\n\n"
     "⚠️ Бот зберігає копії повідомлень на сервері. Ознайомся з розділом «Приватність» перед підключенням."
@@ -514,10 +513,21 @@ def get_chat_display_name(owner_id: int, chat_id: int) -> str:
 
 
 def format_sender(name: str, user_id, username: str = None) -> str:
-    name = html.escape(name or "Невідомо")
+    safe_name = html.escape(name or "Невідомо")
+    safe_id = html.escape(str(user_id))
     if username:
-        return f"{name} (@{html.escape(username)}) [<code>{user_id}</code>]"
-    return f"{name} [<code>{user_id}</code>]"
+        safe_username = html.escape(str(username).lstrip("@"), quote=True)
+        profile_url = f"https://t.me/{safe_username}"
+        name_link = f'<a href="{profile_url}">{safe_name}</a>'
+        nick_link = f'<a href="{profile_url}">@{html.escape(str(username).lstrip("@"))}</a>'
+    elif str(user_id).isdigit():
+        profile_url = f"tg://user?id={int(user_id)}"
+        name_link = f'<a href="{profile_url}">{safe_name}</a>'
+        nick_link = name_link
+    else:
+        name_link = safe_name
+        nick_link = "нікнейм недоступний"
+    return f"{name_link} ({nick_link}) [<code>{safe_id}</code>]"
 
 
 def extract_media(m: Message):
@@ -744,12 +754,10 @@ def main_menu() -> InlineKeyboardMarkup:
 def main_reply_keyboard():
     kb = ReplyKeyboardBuilder()
     kb.button(text="🏠 Меню")
-    kb.button(text="🛠 Налаштування")
     kb.button(text="📊 Статистика")
     kb.button(text="📝 Нотатки")
     kb.button(text="📋 Завдання")
-    kb.button(text="❓ Довідка")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -848,7 +856,6 @@ def tasks_keyboard(owner_id: int):
 @router.message(Command("start", "help"))
 async def cmd_start(m: Message):
     await m.answer(WELCOME, reply_markup=main_menu())
-    await m.answer("Швидкі кнопки 👇", reply_markup=main_reply_keyboard())
 
 
 @router.message(Command("settings"))
@@ -859,22 +866,90 @@ async def cmd_settings(m: Message):
     )
 
 
+def stats_contact_link(owner_id: int, chat_id: int):
+    """Return a Telegram deep link and a display name for a managed private chat."""
+    row = db.execute(
+        "SELECT user_id, username, full_name FROM contacts WHERE owner_id=? AND chat_id=?",
+        (owner_id, chat_id),
+    ).fetchone()
+    user_id = row[0] if row else None
+    username = row[1] if row else None
+    full_name = row[2] if row else None
+    if not full_name:
+        full_name = get_chat_display_name(owner_id, chat_id)
+    if not user_id and chat_id > 0:
+        # In a private Telegram dialog, chat_id is the peer's user ID.
+        user_id = chat_id
+    if username:
+        url = "https://t.me/" + str(username).lstrip("@")
+    elif user_id:
+        url = f"tg://user?id={int(user_id)}"
+    else:
+        url = None
+    return full_name or str(chat_id), user_id, username, url
+
+
+def stats_top_lines(owner_id: int, event: str, limit: int = 10) -> str:
+    rows = db.execute(
+        "SELECT chat_id, COUNT(*) AS total FROM stats_log "
+        "WHERE owner_id=? AND event=? AND chat_id IS NOT NULL "
+        "GROUP BY chat_id ORDER BY total DESC, chat_id ASC LIMIT ?",
+        (owner_id, event, limit),
+    ).fetchall()
+    if not rows:
+        return "Поки немає даних."
+    lines = []
+    for rank, (chat_id, total) in enumerate(rows, 1):
+        name, user_id, username, url = stats_contact_link(owner_id, chat_id)
+        safe_name = html.escape(str(name))
+        if url:
+            clickable = f'<a href="{html.escape(url, quote=True)}">{safe_name}</a>'
+            id_text = f'<a href="{html.escape(url, quote=True)}"><code>{user_id or chat_id}</code></a>'
+        else:
+            clickable = safe_name
+            id_text = f"<code>{chat_id}</code>"
+        nick = f"@{html.escape(username)}" if username else "нікнейм відсутній"
+        lines.append(f"{rank}. {clickable} ({nick}) — <b>{total}</b> повідомлень · ID: {id_text}")
+    return "\n".join(lines)
+
+
 @router.message(Command("stats"))
 async def cmd_stats(m: Message):
     owner_id = m.from_user.id
-    since = time.time() - 7 * 86400
     rows = db.execute(
-        "SELECT event, COUNT(*) FROM stats_log WHERE owner_id=? AND ts>=? GROUP BY event",
-        (owner_id, since),
+        "SELECT event, COUNT(*) FROM stats_log WHERE owner_id=? GROUP BY event",
+        (owner_id,),
     ).fetchall()
     counts = {"received": 0, "edited": 0, "deleted": 0}
     counts.update(dict(rows))
-    await m.answer(
-        "📊 <b>За останні 7 днів</b>\n\n"
-        f"Отримано повідомлень: {counts['received']}\n"
-        f"Відредаговано: {counts['edited']}\n"
-        f"Видалено: {counts['deleted']}"
+
+    text = (
+        "📊 <b>Загальна статистика</b>\n\n"
+        f"📨 Отримано повідомлень: <b>{counts['received']}</b>\n"
+        f"✏️ Відредаговано повідомлень: <b>{counts['edited']}</b>\n"
+        f"🗑 Видалено повідомлень: <b>{counts['deleted']}</b>\n\n"
+        "<b>🏆 ТОП чатів за отриманими повідомленнями</b>\n"
+        f"{stats_top_lines(owner_id, 'received')}\n\n"
+        "<b>🗑 ТОП чатів за видаленими повідомленнями</b>\n"
+        f"{stats_top_lines(owner_id, 'deleted')}\n\n"
+        "<b>✏️ ТОП чатів за відредагованими повідомленнями</b>\n"
+        f"{stats_top_lines(owner_id, 'edited')}"
     )
+    # Telegram message limit is 4096 characters; split only between lines/sections.
+    if len(text) <= 4000:
+        await m.answer(text, disable_web_page_preview=True)
+    else:
+        sections = text.split("\n\n")
+        chunk = ""
+        for section in sections:
+            candidate = (chunk + "\n\n" + section).strip()
+            if len(candidate) > 3900 and chunk:
+                await m.answer(chunk, disable_web_page_preview=True)
+                chunk = section
+            else:
+                chunk = candidate
+        if chunk:
+            await m.answer(chunk, disable_web_page_preview=True)
 
 
 @router.message(Command("tasks"))
@@ -1461,9 +1536,40 @@ async def cb_canceltask(c: CallbackQuery):
     await c.answer("Скасовано")
 
 
+def help_commands_keyboard(second_page: bool = False) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if not second_page:
+        kb.button(text="Наступна сторінка →", callback_data="help:cmds2")
+    kb.button(text="« Назад", callback_data="menu:main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 @router.callback_query(F.data.startswith("help:"))
 async def cb_help(c: CallbackQuery, bot: Bot):
-    page = c.data.split(":")[1]
+    page = c.data.split(":", 1)[1]
+    if page in ("cmds", "cmds1", "cmds2"):
+        raw = HELP_PAGES["cmds"]
+        # Split on line boundaries so no command description is cut in half.
+        lines = raw.splitlines()
+        pages = []
+        chunk = ""
+        for line in lines:
+            candidate = (chunk + "\n" + line).strip()
+            if len(candidate) > 3500 and chunk:
+                pages.append(chunk)
+                chunk = line
+            else:
+                chunk = candidate
+        if chunk:
+            pages.append(chunk)
+        if page == "cmds2":
+            idx = min(1, len(pages) - 1)
+            await c.message.edit_text(pages[idx], reply_markup=help_commands_keyboard(True))
+        else:
+            await c.message.edit_text(pages[0], reply_markup=help_commands_keyboard(False))
+        await c.answer()
+        return
     text = HELP_PAGES[page].replace("{bot_username}", (await bot.me()).username)
     await c.message.edit_text(text, reply_markup=back_keyboard(page))
     await c.answer()
@@ -2059,6 +2165,10 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
             "FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=?",
             (d.business_connection_id, d.chat.id, msg_id),
         ).fetchone()
+        db.execute(
+            "INSERT INTO stats_log(owner_id, event, ts, chat_id) VALUES(?,?,?,?)",
+            (owner_id, "deleted", time.time(), d.chat.id),
+        )
         if not row:
             continue
         deleted_rows.append(row)
@@ -2070,10 +2180,6 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
             db.execute("INSERT OR REPLACE INTO chat_names(owner_id,chat_id,name) VALUES(?,?,?)",
                        (owner_id,d.chat.id,name or str(d.chat.id)))
 
-        db.execute(
-            "INSERT INTO stats_log(owner_id, event, ts, chat_id) VALUES(?,?,?,?)",
-            (owner_id, "deleted", time.time(), d.chat.id),
-        )
 
         if notify:
             name, text, mtype, fid, sender_id, sender_username = row
