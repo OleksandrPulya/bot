@@ -2533,7 +2533,10 @@ async def cmd_archive(m: Message):
     rows=db.execute("SELECT id,chat_id,msg_id,from_name,text,media_type,deleted_at FROM deleted_archive WHERE owner_id=? ORDER BY deleted_at DESC LIMIT 20",(owner,)).fetchall()
     if len(parts)>1 and parts[1].strip().lower()=="clear":
         db.execute("DELETE FROM deleted_archive WHERE owner_id=?",(owner,)); db.commit(); await m.answer("Архів видалених повідомлень очищено."); return
-    lines=[f"#{i} · {html.escape(str(name or 'Невідомо'))} · чат <code>{cid}</code> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')}\n{html.escape((txt or f"[{mt or 'медіа'}]")[:220])}" for i,cid,mid,name,txt,mt,ts in rows]
+    lines=[]
+    for i,cid,mid,name,txt,mt,ts in rows:
+        preview = txt or ("[" + str(mt or "медіа") + "]")
+        lines.append(f"#{i} · {html.escape(str(name or 'Невідомо'))} · чат <code>{cid}</code> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')}\n{html.escape(preview[:220])}")
     await m.answer("🗑 <b>Архів видалених повідомлень</b>\n\n"+("\n\n".join(lines) if lines else "Архів порожній.")+"\n\n/archive clear — очистити архів")
 
 @router.message(Command("smartremind"))
