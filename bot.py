@@ -736,7 +736,8 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text="⚙️ Як це працює", callback_data="help:how")
     kb.button(text="🔇 Команди", callback_data="help:cmds")
     kb.button(text="🔒 Приватність", callback_data="help:privacy")
-    kb.adjust(1, 1, 2)
+    kb.button(text="🛠 Налаштування", callback_data="menu:settings")
+    kb.adjust(1, 1, 2, 1)
     return kb.as_markup()
 
 
