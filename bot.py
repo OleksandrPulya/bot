@@ -557,7 +557,12 @@ async def notify_contact(bot: Bot, owner_chat: int, owner_id: int, chat_id: int,
     db.execute("INSERT INTO event_logs(owner_id,chat_id,action,details,ts) VALUES(?,?,?,?,?)",
                (owner_id, chat_id, action, details, time.time()))
     db.commit()
-    await bot.send_message(owner_chat, contact_card(owner_id, chat_id, action, details))
+    # Додаємо тег саме цього бота в кінці сповіщення, відокремивши його двома переносами.
+    bot_tag = f"@{BOT_USERNAME}" if BOT_USERNAME else ""
+    message_text = contact_card(owner_id, chat_id, action, details)
+    if bot_tag:
+        message_text += f"\n\n{html.escape(bot_tag)}"
+    await bot.send_message(owner_chat, message_text)
 
 
 def log_event(owner_id: int, chat_id: int | None, action: str, details: str = ""):
