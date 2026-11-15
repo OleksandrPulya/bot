@@ -314,15 +314,13 @@ HELP_PAGES = {
     "cmds": (
         "📌 <b>Як користуватися командами</b>\n"
         "Команди з ! надсилай у відповідному особистому чаті від свого імені. Команди зі / надсилай безпосередньо цьому боту.\n\n"
-        "<b>🔇 Команди в особистих чатах</b>\n"
+        "<b>🔇 Команди в особистих чатах</b>\n\n"
         "<code>!мут</code> — додати контакт до списку замучених без обмеження часу.\n"
         "<code>!мут 10хв</code> — замутити контакт на вказаний строк.\n"
         "<code>!анмут</code> — зняти мут із контакту.\n"
         "<code>!віп</code> — додати поточний контакт до VIP.\n"
         "<code>!анвіп</code> — прибрати поточний контакт із VIP.\n"
-        "<code>!важливий</code> — альтернативна команда для додавання контакту до VIP.\n"
-        "<code>!анважливий</code> — альтернативна команда для видалення контакту з VIP.\n"
-        "<code>!тількиважливі</code> — увімкнути або вимкнути сповіщення лише від VIP-контактів.\n"
+        "<code>!тількивіп</code> — увімкнути або вимкнути сповіщення лише від VIP-контактів.\n"
         "<code>!тихийрежим 2г</code> — увімкнути режим «Не турбувати» на заданий строк; без часу — до ручного вимкнення.\n"
         "<code>!повтор 10хв</code> — запланувати повторне сповіщення про цей контакт.\n"
         "<code>!цитата</code> — надіслати останнє збережене повідомлення з цього чату.\n"
@@ -344,14 +342,7 @@ HELP_PAGES = {
         "<code>!дозволити</code> — додати поточний контакт до списку дозволених.\n"
         "<code>!заборонити</code> — прибрати поточний контакт зі списку дозволених.\n"
         "<code>!антиспам</code> — увімкнути або вимкнути фільтр повторюваних однакових повідомлень.\n\n"
-        "<b>⏳ Формат тривалості</b>\n"
-        "<code>10хв</code> — 10 хвилин.\n"
-        "<code>1г</code> — 1 година.\n"
-        "<code>1д</code> — 1 день.\n"
-        "<code>1м</code> — 1 місяць (30 днів).\n"
-        "<code>1р</code> — 1 рік (365 днів).\n"
-        "Число можна змінювати: наприклад, <code>3д</code>, <code>2м</code>, <code>5р</code>.\n\n"
-        "<b>🤖 Команди в чаті з ботом</b>\n"
+        "\n<b>🤖 Команди в чаті з ботом</b>\n\n"
         "<code>/start</code> — відкрити головне меню та привітання.\n"
         "<code>/help</code> — показати довідку та меню.\n"
         "<code>/settings</code> — відкрити інтерактивні налаштування.\n"
@@ -908,7 +899,13 @@ def stats_top_lines(owner_id: int, event: str, limit: int = 10) -> str:
         else:
             clickable = safe_name
             id_text = f"<code>{chat_id}</code>"
-        nick = f"@{html.escape(username)}" if username else "нікнейм відсутній"
+        if username:
+            safe_username = html.escape(str(username).lstrip("@"), quote=True)
+            nick = f'<a href="https://t.me/{safe_username}">@{html.escape(str(username).lstrip("@"))}</a>'
+        elif user_id:
+            nick = f'<a href="tg://user?id={int(user_id)}">відкрити чат</a>'
+        else:
+            nick = "нікнейм відсутній"
         lines.append(f"{rank}. {clickable} ({nick}) — <b>{total}</b> повідомлень · ID: {id_text}")
     return "\n".join(lines)
 
@@ -1654,12 +1651,12 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
         db.commit()
         await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Мут знято")
 
-    elif lower in ("!віп", "!важливий"):
+    elif lower == "!віп":
         db.execute("INSERT OR IGNORE INTO vip VALUES(?,?)", (owner_id, m.chat.id))
         db.commit()
         await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Додано VIP", "Сповіщення проходитимуть навіть у DND")
 
-    elif lower in ("!анвіп", "!анважливий"):
+    elif lower == "!анвіп":
         db.execute("DELETE FROM vip WHERE owner_id=? AND chat_id=?", (owner_id, m.chat.id))
         db.commit()
         await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Статус VIP знято")
@@ -1713,7 +1710,7 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
         db.commit()
         await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Увімкнено тихий режим", parts[1] if len(parts)>1 else "До ручного вимкнення")
 
-    elif lower == "!тількиважливі":
+    elif lower == "!тількивіп":
         get_setting(owner_id, "vip_only")
         db.execute("UPDATE settings SET vip_only=1-vip_only WHERE owner_id=?", (owner_id,))
         db.commit()
