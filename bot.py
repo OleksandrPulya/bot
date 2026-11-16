@@ -2524,8 +2524,11 @@ def command_target_id(m: Message, args: list[str]):
     for entity in (m.entities or []):
         if entity.type == "text_mention" and entity.user:
             return entity.user.id
-    if args and args[0].lstrip("-").isdigit():
-        return int(args[0])
+    # Telegram user IDs are long numeric values. Search all arguments so an
+    # optional role/duration token before or after the ID does not break parsing.
+    numeric_id = next((x for x in args if re.fullmatch(r"-?\d{5,20}", x)), None)
+    if numeric_id:
+        return int(numeric_id)
     if args and args[0].startswith("@"):
         username = args[0].lstrip("@").lower()
         # Telegram Bot API не вміє напряму перетворювати довільний @username
@@ -2540,6 +2543,15 @@ def command_target_id(m: Message, args: list[str]):
                 row = db.execute(
                     "SELECT from_id FROM messages WHERE chat_id=? AND lower(ltrim(from_username,'@'))=? "
                     "AND from_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                    (m.chat.id, username),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+        if not row:
+            try:
+                row = db.execute(
+                    "SELECT user_id FROM group_messages WHERE chat_id=? AND lower(ltrim(username,'@'))=? "
+                    "ORDER BY created_at DESC LIMIT 1",
                     (m.chat.id, username),
                 ).fetchone()
             except sqlite3.OperationalError:
@@ -2594,14 +2606,18 @@ async def group_roles(m: Message, bot: Bot):
         lines = []
         owner = next((a for a in admins if a.status == "creator"), None)
         if owner:
-            lines.append(f"• {html.escape(owner.user.full_name)} — рівень 5: {GROUP_ROLE_NAMES[5]}")
+            owner_link = f'<a href="tg://user?id={owner.user.id}">{html.escape(owner.user.full_name)}</a>'
+            owner_tag = f" (@{html.escape(owner.user.username)})" if owner.user.username else " (без username)"
+            lines.append(f"• {owner_link}{owner_tag} · ID <code>{owner.user.id}</code> — рівень 5: {GROUP_ROLE_NAMES[5]}")
         rows = db.execute("SELECT user_id,level FROM group_roles WHERE chat_id=? ORDER BY level DESC,user_id", (m.chat.id,)).fetchall()
         for uid, level in rows:
             try:
                 member = await bot.get_chat_member(m.chat.id, int(uid))
-                lines.append(f"• {html.escape(member.user.full_name)} — рівень {level}: {GROUP_ROLE_NAMES[int(level)]}")
+                user_link = f'<a href="tg://user?id={member.user.id}">{html.escape(member.user.full_name)}</a>'
+                user_tag = f" (@{html.escape(member.user.username)})" if member.user.username else " (без username)"
+                lines.append(f"• {user_link}{user_tag} · ID <code>{uid}</code> — рівень {level}: {GROUP_ROLE_NAMES[int(level)]}")
             except Exception:
-                lines.append(f"• ID <code>{uid}</code> — рівень {level}: {GROUP_ROLE_NAMES[int(level)]} (не в групі або недоступний)")
+                lines.append(f'• <a href="tg://user?id={int(uid)}">Користувач</a> · ID <code>{uid}</code> — рівень {level}: {GROUP_ROLE_NAMES[int(level)]} (не в групі або недоступний)')
         await m.answer("🏅 <b>Ієрархія адміністраторів бота</b>\n\n" + ("\n".join(lines) if lines else "Адміністраторів бота ще не призначено."))
     except Exception as e:
         await m.answer("Не вдалося отримати список: " + html.escape(str(e)[:250]))
@@ -2695,6 +2711,7 @@ async def group_command_access(m: Message, bot: Bot):
     await m.answer(f"✅ Для !{command} встановлено мінімальний рівень {level} — {GROUP_ROLE_NAMES[level]}.")
 
 @router.message(Command("gcommands"))
+@router.message(F.text.regexp(r"^!gcommands(?:@\w+)?(?:\s|$)"))
 async def group_commands_list(m: Message):
     if not is_group_chat(m):
         return
@@ -2717,8 +2734,8 @@ async def group_commands_list(m: Message):
         "<code>!unmute</code> — зняти обмеження.\n"
         "<code>!purge [КІЛЬКІСТЬ]</code> — видалити повідомлення від відповіді.\n"
         "<code>!pin</code> / <code>!unpin</code> — закріпити/відкріпити повідомлення.\n\n"
-        "Для команд з учасником відповідай на його повідомлення або вкажи його ID. "
-        "Бот повинен мати відповідні права адміністратора.\n\n"
+        "Для команд з учасником: відповідь на його повідомлення, числовий Telegram ID або @username (якщо бот уже бачив цього користувача в групі). "
+        "Профіль відкривається навіть без username. Бот повинен мати відповідні права адміністратора.\n\n"
         "<b>Додаткова модерація:</b> !warn, !warnings, !unwarn, !warnconfig limit/action/duration, !antireklama on/off, !anticaps on/off, !filter add/del/list, !automod links/caps/badwords/repeat/flood on/off, !slowmode 10/off, !quarantine on/off, !antibot on/off, !welcome on/off, !raid on/off, !audit, !report, !appeal.\n"
         "<b>Учасники:</b> !profile, !top, !birthday ДД.ММ, !idea, !ideas, !ideas vote ID, !rules, !rulesaccept.\n"
         "<b>Інструменти адміністратора:</b> !rules set ТЕКСТ, !aiadmin ask ПИТАННЯ, !summary, !gsearch СЛОВО, !gbackup, !grestore, !gpanel, !poll ПИТАННЯ | ВАРІАНТ 1 | ВАРІАНТ 2."
@@ -3238,13 +3255,17 @@ async def group_extended_commands(m: Message, bot: Bot):
         await m.answer("💡 <b>Пропозиції групи</b>\n\n"+("\n".join(f"#{i} · 👍 {v} · {html.escape(t[:180])}" for i,t,v in rows) if rows else "Поки немає пропозицій.")+"\n\nГолос: !ideas vote ID")
         return
     if cmd == "profile":
+        # Можна переглянути себе, відповісти на повідомлення, передати числовий ID
+        # або @username, який бот уже бачив у цій групі. Username не є обов'язковим.
         user=await target_from_command(m,bot) if (m.reply_to_message or payload) else m.from_user
         if not user:
-            await m.answer("Не вдалося визначити учасника."); return
+            await m.answer("Не вдалося знайти учасника. Відповідай на його повідомлення або вкажи числовий Telegram ID: !profile 123456789."); return
         row=db.execute("SELECT xp,messages FROM group_xp WHERE chat_id=? AND user_id=?",(m.chat.id,user.id)).fetchone() or (0,0)
         warns=db.execute("SELECT COUNT(*) FROM group_warns WHERE chat_id=? AND user_id=? AND active=1",(m.chat.id,user.id)).fetchone()[0]
         level=int(row[0]//100)+1
-        await m.answer(f"👤 <b>{html.escape(user.full_name)}</b>\nID: <code>{user.id}</code>\nРівень: <b>{level}</b>\nXP: <b>{row[0]}</b>\nПовідомлень: <b>{row[1]}</b>\nАктивних попереджень: <b>{warns}</b>")
+        profile_name=f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+        username_line=f"Username: @{html.escape(user.username)}" if user.username else "Username: відсутній"
+        await m.answer(f"👤 <b>{profile_name}</b>\nID: <code>{user.id}</code>\n{username_line}\nРівень: <b>{level}</b>\nXP: <b>{row[0]}</b>\nПовідомлень: <b>{row[1]}</b>\nАктивних попереджень: <b>{warns}</b>")
         return
     if cmd == "top":
         rows=db.execute("SELECT user_id,xp,messages FROM group_xp WHERE chat_id=? ORDER BY xp DESC LIMIT 10",(m.chat.id,)).fetchall()
