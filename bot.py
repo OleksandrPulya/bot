@@ -2208,31 +2208,9 @@ async def on_deleted(d: BusinessMessagesDeleted, bot: Bot):
             (d.business_connection_id, d.chat.id, msg_id),
         )
 
-    # Якщо після видалення в цього чату не лишилось жодного збереженого
-    # повідомлення (весь чат очистили/видалили) — надсилаємо повну копію
-    # перепсики текстовим файлом, поки вона остаточно не загубилась.
-    if deleted_rows:
-        remaining = db.execute(
-            "SELECT COUNT(*) FROM messages WHERE conn_id=? AND chat_id=?",
-            (d.business_connection_id, d.chat.id),
-        ).fetchone()[0]
-        if remaining == 0:
-            try:
-                fname = f"chat_dump_{owner_id}_{d.chat.id}_{int(time.time())}.txt"
-                with open(fname, "w", encoding="utf-8") as f:
-                    for name, text, mtype, *_ in deleted_rows:
-                        f.write(f"{name}: {text or f'[{mtype}]'}\n")
-                await bot.send_document(
-                    owner_chat,
-                    FSInputFile(fname),
-                    caption=(
-                        f"🗑 Схоже, чат «{html.escape(get_chat_display_name(owner_id, d.chat.id))}» "
-                        f"повністю очищено. Повна копія перепсики ({len(deleted_rows)} повідомлень)."
-                    ),
-                )
-                os.remove(fname)
-            except Exception as e:
-                logging.warning("Не вдалося надіслати копію чату: %s", e)
+    # Telegram передає лише список видалених повідомлень, а не ознаку
+    # повного очищення чату. Тому не робимо висновок про видалення всього чату
+    # і не надсилаємо файл автоматично після видалення останнього повідомлення.
 
     db.commit()
 
