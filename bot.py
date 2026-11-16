@@ -29,6 +29,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip()
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0").strip() or "0")
+SUPPORT_GROUP_URL = os.getenv("SUPPORT_GROUP_URL", "").strip()
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -42,6 +44,9 @@ db = sqlite3.connect(DB_PATH)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS connections(
     conn_id TEXT PRIMARY KEY, owner_id INTEGER, owner_chat_id INTEGER);
+CREATE TABLE IF NOT EXISTS bot_users(
+    user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
+    first_seen REAL NOT NULL, last_seen REAL NOT NULL, starts INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS settings(
     owner_id INTEGER PRIMARY KEY,
     log_edits INTEGER DEFAULT 1,
@@ -364,9 +369,9 @@ HELP_PAGES = {
         "<code>!автовідповідь off</code> — прибрати окрему автовідповідь для поточного контакту.\n"
         "<code>!дозволити</code> — додати поточний контакт до списку дозволених.\n"
         "<code>!заборонити</code> — прибрати поточний контакт зі списку дозволених.\n"
-        "<code>!антиспам</code> — увімкнути або вимкнути фільтр повторюваних однакових повідомлень.\n\n"
-        "<b>🤖 Команди в чаті з ботом</b>\n\n"
+        "<code>!антиспам</code> — увімкнути або вимкнути фільтр повторюваних однакових повідомлень.\n\n"        "<b>🤖 Команди в чаті з ботом</b>\n\n"
         "<code>/start</code> — відкрити головне меню та привітання.\n"
+        "<code>/users</code> — список користувачів, які запускали бота (лише для власника).\n"
         "<code>/help</code> — показати довідку та меню.\n"
         "<code>/settings</code> — відкрити інтерактивні налаштування.\n"
         "<code>/stats</code> — показати кількість отриманих, відредагованих і видалених повідомлень за 7 днів.\n"
@@ -794,7 +799,11 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text="🔇 Команди", callback_data="help:cmds")
     kb.button(text="🔒 Приватність", callback_data="help:privacy")
     kb.button(text="🛠 Налаштування", callback_data="menu:settings")
-    kb.adjust(1, 1, 2, 1)
+    if SUPPORT_GROUP_URL:
+        kb.button(text="🆘 Технічна підтримка", url=SUPPORT_GROUP_URL)
+    else:
+        kb.button(text="🆘 Технічна підтримка", callback_data="support:info")
+    kb.adjust(1, 1, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -900,9 +909,66 @@ def tasks_keyboard(owner_id: int):
 
 
 # ---------------------- МЕНЮ В ЧАТІ З БОТОМ ----------------------
+def track_bot_user(user, is_start: bool = False):
+    """Record people who have opened the bot; keep first/last seen and start count."""
+    if not user:
+        return
+    now = time.time()
+    db.execute(
+        "INSERT INTO bot_users(user_id, username, full_name, first_seen, last_seen, starts) "
+        "VALUES(?,?,?,?,?,1) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+        "full_name=excluded.full_name, last_seen=excluded.last_seen, "
+        "starts=bot_users.starts+excluded.starts",
+        (user.id, user.username, user.full_name, now, now, int(is_start)),
+    )
+    db.commit()
+
+
 @router.message(Command("start", "help"))
 async def cmd_start(m: Message):
+    if m.chat.type == "private":
+        command = (m.text or "").split(maxsplit=1)[0].split("@")[0].lower()
+        track_bot_user(m.from_user, is_start=(command == "/start"))
     await m.answer(WELCOME, reply_markup=main_menu())
+
+
+@router.message(Command("users"))
+async def cmd_users(m: Message):
+    if m.chat.type != "private":
+        return
+    if not BOT_OWNER_ID or not m.from_user or m.from_user.id != BOT_OWNER_ID:
+        await m.answer("⛔ Ця команда доступна лише власнику бота.")
+        return
+
+    total = db.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+    rows = db.execute(
+        "SELECT user_id, username, full_name, first_seen, last_seen, starts "
+        "FROM bot_users ORDER BY last_seen DESC LIMIT 100"
+    ).fetchall()
+    if not rows:
+        await m.answer("Поки що ніхто не запускав бота.")
+        return
+
+    lines = [f"👥 <b>Користувачі бота: {total}</b>", ""]
+    for uid, username, full_name, first_seen, last_seen, starts in rows:
+        name = html.escape(full_name or "Без імені")
+        nick = f"@{html.escape(username)}" if username else "без username"
+        lines.append(
+            f'• <a href="tg://user?id={uid}">{name}</a> ({nick})\n'
+            f"  ID: <code>{uid}</code> · запусків: {starts}\n"
+            f"  Останній вхід: {datetime.fromtimestamp(last_seen).strftime('%d.%m.%Y %H:%M')}"
+        )
+    # Telegram limits a message to 4096 characters; send the list in safe chunks.
+    header = lines[0] + "\n\n"
+    chunk = header
+    for line in lines[2:]:
+        if len(chunk) + len(line) + 2 > 3800:
+            await m.answer(chunk)
+            chunk = "👥 <b>Продовження списку</b>\n\n"
+        chunk += line + "\n\n"
+    if chunk.strip():
+        await m.answer(chunk)
 
 
 @router.message(Command("settings"))
@@ -1579,6 +1645,14 @@ async def cb_main(c: CallbackQuery):
     await c.answer()
 
 
+@router.callback_query(F.data == "support:info")
+async def cb_support_info(c: CallbackQuery):
+    await c.answer(
+        "Посилання на групу підтримки ще не налаштоване. Додайте SUPPORT_GROUP_URL у змінні середовища Render.",
+        show_alert=True,
+    )
+
+
 @router.callback_query(F.data == "menu:settings")
 async def cb_settings(c: CallbackQuery):
     await c.message.edit_text(
@@ -1635,8 +1709,8 @@ async def cb_canceltask(c: CallbackQuery):
 def help_commands_keyboard(category: str = "root") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if category == "root":
-        kb.button(text="👤 Команди в особистих чатах", callback_data="help:cmds_private")
         kb.button(text="🤖 Команди в чаті з ботом", callback_data="help:cmds_bot")
+        kb.button(text="👤 Команди в особистих чатах", callback_data="help:cmds_private")
         kb.button(text="👥 Команди в групах", callback_data="help:cmds_group")
         kb.button(text="« Назад", callback_data="menu:main")
     else:
