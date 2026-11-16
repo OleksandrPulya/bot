@@ -154,6 +154,14 @@ ensure_column("settings", "antispam_enabled", "INTEGER DEFAULT 0")
 ensure_column("settings", "vip_only", "INTEGER DEFAULT 0")
 ensure_column("settings", "auto_delete_hours", "INTEGER DEFAULT 0")
 ensure_column("settings", "auto_backup_enabled", "INTEGER DEFAULT 0")
+db.executescript("""
+CREATE TABLE IF NOT EXISTS group_roles(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, level INTEGER NOT NULL,
+    added_by INTEGER, created_at REAL, PRIMARY KEY(chat_id, user_id));
+CREATE TABLE IF NOT EXISTS group_command_access(
+    chat_id INTEGER NOT NULL, command TEXT NOT NULL, min_level INTEGER NOT NULL,
+    changed_by INTEGER, updated_at REAL, PRIMARY KEY(chat_id, command));
+""")
 db.commit()
 
 SETTING_TITLES = {
@@ -1580,7 +1588,7 @@ async def cb_help(c: CallbackQuery, bot: Bot):
     page = c.data.split(":", 1)[1]
     if page == "cmds":
         await c.message.edit_text(
-            "📚 <b>Команди</b>\\n\\nОбери, де саме потрібно виконати команду:",
+            "📚 <b>Команди</b>\n\nОбери, де саме потрібно виконати команду:",
             reply_markup=help_commands_keyboard("root"),
         )
         await c.answer()
@@ -1597,7 +1605,7 @@ async def cb_help(c: CallbackQuery, bot: Bot):
             lines = bot_commands.splitlines()
             chunks, chunk = [], ""
             for line in lines:
-                candidate = (chunk + "\\n" + line).strip()
+                candidate = (chunk + "\n" + line).strip()
                 if len(candidate) > 3500 and chunk:
                     chunks.append(chunk)
                     chunk = line
@@ -1607,21 +1615,21 @@ async def cb_help(c: CallbackQuery, bot: Bot):
             body = chunks[1] if page == "cmds_bot2" and len(chunks) > 1 else chunks[0]
         else:
             body = (
-                "👥 <b>Команди керування групою</b>\\n\\n"
-                "<code>/help</code> — довідка з керування групою.\\n"
-                "<code>/info</code> — інформація про групу та права бота.\\n"
-                "<code>/admins</code> — список адміністраторів.\\n"
-                "<code>/title НАЗВА</code> — змінити назву групи.\\n"
-                "<code>/description ТЕКСТ</code> — змінити опис групи.\\n"
-                "<code>/ban</code> — заблокувати учасника (відповіддю на його повідомлення).\\n"
-                "<code>/unban USER_ID</code> — розблокувати учасника.\\n"
-                "<code>/kick</code> — видалити учасника (відповіддю на повідомлення).\\n"
-                "<code>/mute 10m</code> — заборонити писати на час (відповіддю).\\n"
-                "<code>/unmute</code> — зняти обмеження (відповіддю).\\n"
-                "<code>/purge 20</code> — видалити до 20 повідомлень, починаючи з відповіді.\\n"
-                "<code>/pin</code> — закріпити повідомлення (відповіддю).\\n"
-                "<code>/unpin</code> — відкріпити повідомлення (відповіддю).\\n\\n"
-                "Бот має бути адміністратором із відповідними правами. Команди модерації доступні лише адміністраторам групи."
+                "👥 <b>Команди керування групою</b>\n\n"
+                "<code>/help</code> — довідка з керування групою.\n"
+                "<code>/info</code> — інформація про групу та права бота.\n"
+                "<code>/admins</code> — список адміністраторів.\n"
+                "<code>/title НАЗВА</code> — змінити назву групи.\n"
+                "<code>/description ТЕКСТ</code> — змінити опис групи.\n"
+                "<code>/ban</code> — заблокувати учасника (відповіддю на його повідомлення).\n"
+                "<code>/unban USER_ID</code> — розблокувати учасника.\n"
+                "<code>/kick</code> — видалити учасника (відповіддю на повідомлення).\n"
+                "<code>/mute 10m</code> — заборонити писати на час (відповіддю).\n"
+                "<code>/unmute</code> — зняти обмеження (відповіддю).\n"
+                "<code>/purge 20</code> — видалити до 20 повідомлень, починаючи з відповіді.\n"
+                "<code>/pin</code> — закріпити повідомлення (відповіддю).\n"
+                "<code>/unpin</code> — відкріпити повідомлення (відповіддю).\n\n"
+                "Бот має бути адміністратором із відповідними правами. Рівні адміністраторів бота налаштовуються окремо від статусу адміністратора Telegram."
             )
         menu_category = "cmds_bot" if page == "cmds_bot" else page
         await c.message.edit_text(body, reply_markup=help_commands_keyboard(menu_category))
@@ -2364,28 +2372,189 @@ def is_group_chat(m: Message) -> bool:
     return bool(m.chat and m.chat.type in ("group", "supergroup"))
 
 
+# Рівні доступу: 1 — молодший адміністратор, 2 — модератор,
+# 3 — старший модератор, 4 — заступник власника, 5 — власник групи.
+GROUP_ROLE_NAMES = {
+    1: "Молодший адміністратор", 2: "Модератор", 3: "Старший модератор",
+    4: "Заступник власника", 5: "Власник групи",
+}
+GROUP_COMMAND_LEVELS = {
+    "info": 1, "admins": 1, "roles": 1,
+    "mute": 2, "unmute": 2, "kick": 2,
+    "ban": 3, "unban": 3, "purge": 3,
+    "pin": 3, "unpin": 3,
+    "title": 4, "description": 4,
+}
+
+async def group_user_level(chat_id: int, user_id: int, bot: Bot) -> int:
+    """Власник Telegram-групи завжди має рівень 5; інші — з БД."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status == "creator":
+            return 5
+    except Exception:
+        return 0
+    row = db.execute("SELECT level FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    return int(row[0]) if row else 0
+
 async def require_group_admin(m: Message, bot: Bot) -> bool:
     if not is_group_chat(m):
         await m.answer("Ця команда працює лише в групах і супергрупах.")
         return False
+    command = (m.text or "").split(maxsplit=1)[0].split("@")[0].lstrip("/").lower()
+    default_level = GROUP_COMMAND_LEVELS.get(command, 2)
+    row = db.execute("SELECT min_level FROM group_command_access WHERE chat_id=? AND command=?", (m.chat.id, command)).fetchone()
+    required_level = int(row[0]) if row else default_level
     try:
-        member = await bot.get_chat_member(m.chat.id, m.from_user.id)
-        if member.status not in ("creator", "administrator"):
-            await m.answer("⛔ Команда доступна лише адміністраторам групи.")
+        actor_level = await group_user_level(m.chat.id, m.from_user.id, bot)
+        if actor_level < required_level:
+            await m.answer(f"⛔ Недостатній рівень доступу. Для /{html.escape(command)} потрібен рівень {required_level} ({GROUP_ROLE_NAMES[required_level]}). Ваш рівень: {actor_level}.")
             return False
         me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
         if me.status != "administrator":
-            await m.answer("Спочатку додай бота в адміністратори групи.")
+            await m.answer("Спочатку додай бота в адміністратори групи з потрібними правами.")
             return False
     except Exception as e:
-        await m.answer("Не вдалося перевірити права адміністратора: " + html.escape(str(e)[:250]))
+        await m.answer("Не вдалося перевірити права: " + html.escape(str(e)[:250]))
         return False
     return True
+
+async def management_actor_level(m: Message, bot: Bot, minimum: int = 4) -> int:
+    if not is_group_chat(m):
+        await m.answer("Команда доступна лише в групі.")
+        return 0
+    level = await group_user_level(m.chat.id, m.from_user.id, bot)
+    if level < minimum:
+        await m.answer(f"⛔ Потрібен рівень {minimum} ({GROUP_ROLE_NAMES[minimum]}).")
+        return 0
+    try:
+        me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
+        if me.status != "administrator":
+            await m.answer("Спочатку додай бота в адміністратори групи.")
+            return 0
+    except Exception as e:
+        await m.answer("Не вдалося перевірити права бота: " + html.escape(str(e)[:200]))
+        return 0
+    return level
+
+def command_target_id(m: Message, args: list[str]):
+    if m.reply_to_message and m.reply_to_message.from_user:
+        return m.reply_to_message.from_user.id
+    if args and args[0].lstrip("-").isdigit():
+        return int(args[0])
+    return None
 
 
 def replied_user(m: Message):
     return m.reply_to_message.from_user if m.reply_to_message else None
 
+
+@router.message(Command("roles"))
+async def group_roles(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    if not is_group_chat(m):
+        await m.answer("Команда доступна лише в групі."); return
+    try:
+        admins = await bot.get_chat_administrators(m.chat.id)
+        lines = []
+        owner = next((a for a in admins if a.status == "creator"), None)
+        if owner:
+            lines.append(f"• {html.escape(owner.user.full_name)} — рівень 5: {GROUP_ROLE_NAMES[5]}")
+        rows = db.execute("SELECT user_id,level FROM group_roles WHERE chat_id=? ORDER BY level DESC,user_id", (m.chat.id,)).fetchall()
+        for uid, level in rows:
+            try:
+                member = await bot.get_chat_member(m.chat.id, int(uid))
+                lines.append(f"• {html.escape(member.user.full_name)} — рівень {level}: {GROUP_ROLE_NAMES[int(level)]}")
+            except Exception:
+                lines.append(f"• ID <code>{uid}</code> — рівень {level}: {GROUP_ROLE_NAMES[int(level)]} (не в групі або недоступний)")
+        await m.answer("🏅 <b>Ієрархія адміністраторів бота</b>\n\n" + ("\n".join(lines) if lines else "Адміністраторів бота ще не призначено."))
+    except Exception as e:
+        await m.answer("Не вдалося отримати список: " + html.escape(str(e)[:250]))
+
+@router.message(Command("adminadd"))
+async def group_admin_add(m: Message, bot: Bot):
+    actor = await management_actor_level(m, bot, 4)
+    if not actor: return
+    args = (m.text or "").split()[1:]
+    target_id = command_target_id(m, args)
+    level_arg = next((x for x in args if x.isdigit() and int(x) in range(1,5)), None)
+    new_level = int(level_arg) if level_arg else 1
+    if not target_id:
+        await m.answer("Формат: /adminadd USER_ID [РІВЕНЬ 1-4] або відповідь на повідомлення."); return
+    if new_level >= actor:
+        await m.answer("Не можна призначити рівень, рівний або вищий за ваш."); return
+    try:
+        member = await bot.get_chat_member(m.chat.id, target_id)
+        if member.status == "creator":
+            await m.answer("Власник групи вже має рівень 5."); return
+        db.execute("INSERT INTO group_roles(chat_id,user_id,level,added_by,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET level=excluded.level,added_by=excluded.added_by,created_at=excluded.created_at", (m.chat.id,target_id,new_level,m.from_user.id,time.time()))
+        db.commit()
+        await m.answer(f"✅ {html.escape(member.user.full_name)} призначено: рівень {new_level} — {GROUP_ROLE_NAMES[new_level]}.")
+    except Exception as e:
+        await m.answer("Не вдалося додати адміністратора. Перевір USER_ID та участь користувача в групі. " + html.escape(str(e)[:180]))
+
+@router.message(Command("adminremove"))
+async def group_admin_remove(m: Message, bot: Bot):
+    actor = await management_actor_level(m, bot, 4)
+    if not actor: return
+    args = (m.text or "").split()[1:]
+    target_id = command_target_id(m, args)
+    if not target_id:
+        await m.answer("Формат: /adminremove USER_ID або відповідь на повідомлення."); return
+    target_level = await group_user_level(m.chat.id, target_id, bot)
+    if target_level == 5 or target_level >= actor:
+        await m.answer("Не можна зняти адміністратора з таким самим або вищим рівнем."); return
+    db.execute("DELETE FROM group_roles WHERE chat_id=? AND user_id=?", (m.chat.id,target_id)); db.commit()
+    await m.answer("✅ Права адміністратора бота знято." if target_level else "У цього користувача не було ролі адміністратора бота.")
+
+async def change_group_role(m: Message, bot: Bot, delta: int):
+    actor = await management_actor_level(m, bot, 4)
+    if not actor: return
+    args = (m.text or "").split()[1:]
+    target_id = command_target_id(m, args)
+    if not target_id:
+        await m.answer("Вкажи USER_ID або відповідай на повідомлення користувача."); return
+    old_level = await group_user_level(m.chat.id, target_id, bot)
+    if old_level == 5 or old_level >= actor or old_level == 0:
+        await m.answer("Цього користувача не можна змінити: він не має ролі або має рівень не нижчий за ваш."); return
+    new_level = max(1, min(4, old_level + delta))
+    if new_level == old_level:
+        await m.answer("Досягнуто межі ієрархії (1–4). Рівень 5 зарезервовано власнику групи."); return
+    db.execute("UPDATE group_roles SET level=?,added_by=?,created_at=? WHERE chat_id=? AND user_id=?", (new_level,m.from_user.id,time.time(),m.chat.id,target_id)); db.commit()
+    await m.answer(f"✅ Рівень змінено: {old_level} → {new_level} ({GROUP_ROLE_NAMES[new_level]}).")
+
+@router.message(Command("promote"))
+async def group_promote(m: Message, bot: Bot):
+    await change_group_role(m, bot, 1)
+
+@router.message(Command("demote"))
+async def group_demote(m: Message, bot: Bot):
+    await change_group_role(m, bot, -1)
+
+@router.message(Command("cmdaccess"))
+async def group_command_access(m: Message, bot: Bot):
+    actor = await management_actor_level(m, bot, 5)
+    if not actor: return
+    args = (m.text or "").split()[1:]
+    if not args:
+        rows = db.execute("SELECT command,min_level FROM group_command_access WHERE chat_id=? ORDER BY command", (m.chat.id,)).fetchall()
+        overrides = {c:l for c,l in rows}
+        lines = [f"/{cmd} — рівень {overrides.get(cmd, lvl)} (типово {lvl})" for cmd,lvl in sorted(GROUP_COMMAND_LEVELS.items())]
+        await m.answer("⚙️ <b>Доступ до команд</b>\n\n" + "\n".join(lines) + "\n\nЗмінити: /cmdaccess КОМАНДА РІВЕНЬ (1–5).\nСкинути: /cmdaccess КОМАНДА default")
+        return
+    command = args[0].lstrip("/").lower()
+    if command not in GROUP_COMMAND_LEVELS:
+        await m.answer("Невідома команда. Переглянь список через /cmdaccess."); return
+    if len(args) < 2:
+        await m.answer("Формат: /cmdaccess КОМАНДА РІВЕНЬ (1–5) або default."); return
+    if args[1].lower() == "default":
+        db.execute("DELETE FROM group_command_access WHERE chat_id=? AND command=?", (m.chat.id,command)); db.commit()
+        await m.answer(f"✅ Для /{command} відновлено типовий рівень {GROUP_COMMAND_LEVELS[command]}."); return
+    if not args[1].isdigit() or int(args[1]) not in range(1,6):
+        await m.answer("Рівень має бути числом від 1 до 5."); return
+    level = int(args[1])
+    db.execute("INSERT INTO group_command_access(chat_id,command,min_level,changed_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,command) DO UPDATE SET min_level=excluded.min_level,changed_by=excluded.changed_by,updated_at=excluded.updated_at", (m.chat.id,command,level,m.from_user.id,time.time())); db.commit()
+    await m.answer(f"✅ Для /{command} встановлено мінімальний рівень {level} — {GROUP_ROLE_NAMES[level]}.")
 
 @router.message(Command("help"))
 async def group_help(m: Message):
@@ -2401,12 +2570,13 @@ async def group_help(m: Message):
         "<code>/admins</code> — список адміністраторів.\\n"
         "<code>/title НАЗВА</code> — змінити назву групи.\\n"
         "<code>/description ТЕКСТ</code> — змінити опис групи.\\n\\n"
-        "Бот повинен бути адміністратором із дозволом блокувати/обмежувати учасників, видаляти та закріплювати повідомлення."
+        "Бот повинен бути адміністратором із дозволом блокувати/обмежувати учасників, видаляти та закріплювати повідомлення. Ролі бота не змінюють статус адміністратора Telegram."
     )
 
 
 @router.message(Command("info"))
 async def group_info(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
     if not is_group_chat(m):
         await m.answer("Команда доступна лише в групі.")
         return
@@ -2426,6 +2596,7 @@ async def group_info(m: Message, bot: Bot):
 
 @router.message(Command("admins"))
 async def group_admins(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
     if not is_group_chat(m):
         await m.answer("Команда доступна лише в групі.")
         return
