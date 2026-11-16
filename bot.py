@@ -3144,6 +3144,36 @@ async def cmd_backups(m: Message):
     await m.answer("💾 <b>Історія резервних копій</b>\n\n"+("\n".join(f"{datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M')} — {size:,} байт" for ts,size in rows) if rows else "Копій ще не створювали.")+"\n\n/backup — створити нову копію\n/backup auto — щотижневе копіювання")
 
 
+# ПОВІДОМЛЕННЯ КОРИСТУВАЧАМ ПІСЛЯ ПЕРЕЗАПУСКУ
+async def notify_users_about_restart(bot: Bot):
+    """Надсилає особисте повідомлення всім, хто раніше запускав бота."""
+    user_ids = [
+        row[0] for row in db.execute(
+            "SELECT user_id FROM bot_users ORDER BY user_id"
+        ).fetchall()
+    ]
+    sent = 0
+    failed = 0
+
+    for user_id in user_ids:
+        try:
+            await bot.send_message(
+                user_id,
+                "🔄 <b>Бота було перезапущено!</b>\\n\\n"
+                "Щоб знову користуватися ботом, натисни команду /start."
+            )
+            sent += 1
+            await asyncio.sleep(0.04)  # невелика пауза, щоб не перевищувати ліміти Telegram
+        except Exception as e:
+            failed += 1
+            logging.info("Не вдалося надіслати повідомлення про перезапуск користувачу %s: %s", user_id, e)
+
+    logging.info(
+        "Повідомлення про перезапуск: надіслано %s, не доставлено %s, всього %s",
+        sent, failed, len(user_ids)
+    )
+
+
 # ЗАПУСК
 async def main():
     global BOT_USERNAME
@@ -3160,6 +3190,10 @@ async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.me()
     BOT_USERNAME = me.username
+
+    # Повідомляємо всіх користувачів, які раніше натискали /start.
+    await notify_users_about_restart(bot)
+
     dp = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(scheduler_loop(bot))
