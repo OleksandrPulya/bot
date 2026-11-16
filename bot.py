@@ -916,7 +916,7 @@ def track_bot_user(user, is_start: bool = False):
     now = time.time()
     db.execute(
         "INSERT INTO bot_users(user_id, username, full_name, first_seen, last_seen, starts) "
-        "VALUES(?,?,?,?,?,1) "
+        "VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
         "full_name=excluded.full_name, last_seen=excluded.last_seen, "
         "starts=bot_users.starts+excluded.starts",
