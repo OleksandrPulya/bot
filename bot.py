@@ -2401,14 +2401,14 @@ async def require_group_admin(m: Message, bot: Bot) -> bool:
     if not is_group_chat(m):
         await m.answer("Ця команда працює лише в групах і супергрупах.")
         return False
-    command = (m.text or "").split(maxsplit=1)[0].split("@")[0].lstrip("/").lower()
+    command = (m.text or "").split(maxsplit=1)[0].split("@")[0].lstrip("/!").lower()
     default_level = GROUP_COMMAND_LEVELS.get(command, 2)
     row = db.execute("SELECT min_level FROM group_command_access WHERE chat_id=? AND command=?", (m.chat.id, command)).fetchone()
     required_level = int(row[0]) if row else default_level
     try:
         actor_level = await group_user_level(m.chat.id, m.from_user.id, bot)
         if actor_level < required_level:
-            await m.answer(f"⛔ Недостатній рівень доступу. Для /{html.escape(command)} потрібен рівень {required_level} ({GROUP_ROLE_NAMES[required_level]}). Ваш рівень: {actor_level}.")
+            await m.answer(f"⛔ Недостатній рівень доступу. Для !{html.escape(command)} потрібен рівень {required_level} ({GROUP_ROLE_NAMES[required_level]}). Ваш рівень: {actor_level}.")
             return False
         me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
         if me.status != "administrator":
@@ -2440,8 +2440,37 @@ async def management_actor_level(m: Message, bot: Bot, minimum: int = 4) -> int:
 def command_target_id(m: Message, args: list[str]):
     if m.reply_to_message and m.reply_to_message.from_user:
         return m.reply_to_message.from_user.id
+    for entity in (m.entities or []):
+        if entity.type == "text_mention" and entity.user:
+            return entity.user.id
     if args and args[0].lstrip("-").isdigit():
         return int(args[0])
+    if args and args[0].startswith("@"):
+        username = args[0].lstrip("@").lower()
+        row = db.execute(
+            "SELECT user_id FROM contacts WHERE lower(username)=? AND user_id IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (username,),
+        ).fetchone()
+        if row:
+            return int(row[0])
+    return None
+
+
+async def resolve_group_target(m: Message, bot: Bot):
+    if m.reply_to_message and m.reply_to_message.from_user:
+        return m.reply_to_message.from_user
+    for entity in (m.entities or []):
+        if entity.type == "text_mention" and entity.user:
+            return entity.user
+    args = (m.text or "").split()[1:]
+    target_id = command_target_id(m, args)
+    if target_id:
+        try:
+            member = await bot.get_chat_member(m.chat.id, target_id)
+            return member.user
+        except Exception:
+            return None
     return None
 
 
@@ -2449,7 +2478,21 @@ def replied_user(m: Message):
     return m.reply_to_message.from_user if m.reply_to_message else None
 
 
-@router.message(Command("roles"))
+def group_command_payload(m: Message) -> str:
+    raw = m.text or ""
+    return re.sub(r"^!\w+(?:@\w+)?", "", raw, count=1).lstrip()
+
+
+def punishment_reason(m: Message, consume_target: bool = False, consume_duration: bool = False) -> str:
+    payload = group_command_payload(m)
+    if consume_target and payload:
+        payload = payload.split(maxsplit=1)[1] if len(payload.split(maxsplit=1)) > 1 else ""
+    if consume_duration and payload:
+        payload = payload.split(maxsplit=1)[1] if len(payload.split(maxsplit=1)) > 1 else ""
+    return payload.strip()
+
+
+@router.message(F.text.regexp(r"^!roles(?:@\w+)?(?:\s|$)"))
 async def group_roles(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     if not is_group_chat(m):
@@ -2471,7 +2514,7 @@ async def group_roles(m: Message, bot: Bot):
     except Exception as e:
         await m.answer("Не вдалося отримати список: " + html.escape(str(e)[:250]))
 
-@router.message(Command("adminadd"))
+@router.message(F.text.regexp(r"^!adminadd(?:@\w+)?(?:\s|$)"))
 async def group_admin_add(m: Message, bot: Bot):
     actor = await management_actor_level(m, bot, 4)
     if not actor: return
@@ -2480,7 +2523,7 @@ async def group_admin_add(m: Message, bot: Bot):
     level_arg = next((x for x in args if x.isdigit() and int(x) in range(1,5)), None)
     new_level = int(level_arg) if level_arg else 1
     if not target_id:
-        await m.answer("Формат: /adminadd USER_ID [РІВЕНЬ 1-4] або відповідь на повідомлення."); return
+        await m.answer("Формат: !adminadd USER_ID [РІВЕНЬ 1-4] або відповідь на повідомлення."); return
     if new_level >= actor:
         await m.answer("Не можна призначити рівень, рівний або вищий за ваш."); return
     try:
@@ -2493,14 +2536,14 @@ async def group_admin_add(m: Message, bot: Bot):
     except Exception as e:
         await m.answer("Не вдалося додати адміністратора. Перевір USER_ID та участь користувача в групі. " + html.escape(str(e)[:180]))
 
-@router.message(Command("adminremove"))
+@router.message(F.text.regexp(r"^!adminremove(?:@\w+)?(?:\s|$)"))
 async def group_admin_remove(m: Message, bot: Bot):
     actor = await management_actor_level(m, bot, 4)
     if not actor: return
     args = (m.text or "").split()[1:]
     target_id = command_target_id(m, args)
     if not target_id:
-        await m.answer("Формат: /adminremove USER_ID або відповідь на повідомлення."); return
+        await m.answer("Формат: !adminremove USER_ID або відповідь на повідомлення."); return
     target_level = await group_user_level(m.chat.id, target_id, bot)
     if target_level == 5 or target_level >= actor:
         await m.answer("Не можна зняти адміністратора з таким самим або вищим рівнем."); return
@@ -2523,15 +2566,15 @@ async def change_group_role(m: Message, bot: Bot, delta: int):
     db.execute("UPDATE group_roles SET level=?,added_by=?,created_at=? WHERE chat_id=? AND user_id=?", (new_level,m.from_user.id,time.time(),m.chat.id,target_id)); db.commit()
     await m.answer(f"✅ Рівень змінено: {old_level} → {new_level} ({GROUP_ROLE_NAMES[new_level]}).")
 
-@router.message(Command("promote"))
+@router.message(F.text.regexp(r"^!promote(?:@\w+)?(?:\s|$)"))
 async def group_promote(m: Message, bot: Bot):
     await change_group_role(m, bot, 1)
 
-@router.message(Command("demote"))
+@router.message(F.text.regexp(r"^!demote(?:@\w+)?(?:\s|$)"))
 async def group_demote(m: Message, bot: Bot):
     await change_group_role(m, bot, -1)
 
-@router.message(Command("cmdaccess"))
+@router.message(F.text.regexp(r"^!cmdaccess(?:@\w+)?(?:\s|$)"))
 async def group_command_access(m: Message, bot: Bot):
     actor = await management_actor_level(m, bot, 5)
     if not actor: return
@@ -2539,42 +2582,57 @@ async def group_command_access(m: Message, bot: Bot):
     if not args:
         rows = db.execute("SELECT command,min_level FROM group_command_access WHERE chat_id=? ORDER BY command", (m.chat.id,)).fetchall()
         overrides = {c:l for c,l in rows}
-        lines = [f"/{cmd} — рівень {overrides.get(cmd, lvl)} (типово {lvl})" for cmd,lvl in sorted(GROUP_COMMAND_LEVELS.items())]
-        await m.answer("⚙️ <b>Доступ до команд</b>\n\n" + "\n".join(lines) + "\n\nЗмінити: /cmdaccess КОМАНДА РІВЕНЬ (1–5).\nСкинути: /cmdaccess КОМАНДА default")
+        lines = [f"!{cmd} — рівень {overrides.get(cmd, lvl)} (типово {lvl})" for cmd,lvl in sorted(GROUP_COMMAND_LEVELS.items())]
+        await m.answer("⚙️ <b>Доступ до команд</b>\n\n" + "\n".join(lines) + "\n\nЗмінити: !cmdaccess КОМАНДА РІВЕНЬ (1–5).\nСкинути: !cmdaccess КОМАНДА default")
         return
-    command = args[0].lstrip("/").lower()
+    command = args[0].lstrip("/!").lower()
     if command not in GROUP_COMMAND_LEVELS:
-        await m.answer("Невідома команда. Переглянь список через /cmdaccess."); return
+        await m.answer("Невідома команда. Переглянь список через !cmdaccess."); return
     if len(args) < 2:
-        await m.answer("Формат: /cmdaccess КОМАНДА РІВЕНЬ (1–5) або default."); return
+        await m.answer("Формат: !cmdaccess КОМАНДА РІВЕНЬ (1–5) або default."); return
     if args[1].lower() == "default":
         db.execute("DELETE FROM group_command_access WHERE chat_id=? AND command=?", (m.chat.id,command)); db.commit()
-        await m.answer(f"✅ Для /{command} відновлено типовий рівень {GROUP_COMMAND_LEVELS[command]}."); return
+        await m.answer(f"✅ Для !{command} відновлено типовий рівень {GROUP_COMMAND_LEVELS[command]}."); return
     if not args[1].isdigit() or int(args[1]) not in range(1,6):
         await m.answer("Рівень має бути числом від 1 до 5."); return
     level = int(args[1])
     db.execute("INSERT INTO group_command_access(chat_id,command,min_level,changed_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,command) DO UPDATE SET min_level=excluded.min_level,changed_by=excluded.changed_by,updated_at=excluded.updated_at", (m.chat.id,command,level,m.from_user.id,time.time())); db.commit()
-    await m.answer(f"✅ Для /{command} встановлено мінімальний рівень {level} — {GROUP_ROLE_NAMES[level]}.")
+    await m.answer(f"✅ Для !{command} встановлено мінімальний рівень {level} — {GROUP_ROLE_NAMES[level]}.")
 
-@router.message(Command("help"))
-async def group_help(m: Message):
+@router.message(Command("gcommands"))
+async def group_commands_list(m: Message):
+    if not is_group_chat(m):
+        return
     await m.answer(
-        "👥 <b>Керування групою</b>\\n\\n"
-        "Використовуй команди у відповідь на повідомлення учасника:\\n"
-        "<code>/ban</code> — заблокувати; <code>/kick</code> — видалити; "
-        "<code>/mute 10хв</code> — тимчасово обмежити; <code>/unmute</code> — зняти обмеження.\\n"
-        "<code>/unban USER_ID</code> — розблокувати за ID.\\n"
-        "<code>/purge 20</code> — видалити до 20 повідомлень від вибраного повідомлення назад.\\n"
-        "<code>/pin</code> та <code>/unpin</code> — керувати закріпленням.\\n"
-        "<code>/info</code> — перевірити групу та права бота.\\n"
-        "<code>/admins</code> — список адміністраторів.\\n"
-        "<code>/title НАЗВА</code> — змінити назву групи.\\n"
-        "<code>/description ТЕКСТ</code> — змінити опис групи.\\n\\n"
-        "Бот повинен бути адміністратором із дозволом блокувати/обмежувати учасників, видаляти та закріплювати повідомлення. Ролі бота не змінюють статус адміністратора Telegram."
+        "👥 <b>Дійсні команди групи</b>\n\n"
+        "<code>!help</code> — довідка з команд групи.\n"
+        "<code>!info</code> — інформація про групу та права бота.\n"
+        "<code>!admins</code> — адміністратори, призначені в системі бота.\n"
+        "<code>!tgadmins</code> — адміністратори Telegram-групи.\n"
+        "<code>!roles</code> — ієрархія адміністраторів бота.\n"
+        "<code>!adminadd USER_ID [1-4]</code> — призначити адміністратора.\n"
+        "<code>!adminremove USER_ID</code> — зняти роль адміністратора.\n"
+        "<code>!promote USER_ID</code> / <code>!demote USER_ID</code> — змінити рівень.\n"
+        "<code>!cmdaccess</code> — переглянути/налаштувати доступ до команд.\n"
+        "<code>!title НАЗВА</code> — змінити назву групи.\n"
+        "<code>!description ТЕКСТ</code> — змінити опис групи.\n"
+        "<code>!ban</code> / <code>!unban USER_ID</code> — блокування/розблокування.\n"
+        "<code>!kick</code> — видалити учасника.\n"
+        "<code>!mute USER TIME</code> — обмежити учасника на обов’язковий строк.\n"
+        "<code>!unmute</code> — зняти обмеження.\n"
+        "<code>!purge [КІЛЬКІСТЬ]</code> — видалити повідомлення від відповіді.\n"
+        "<code>!pin</code> / <code>!unpin</code> — закріпити/відкріпити повідомлення.\n\n"
+        "Для команд з учасником відповідай на його повідомлення або вкажи його ID. "
+        "Бот повинен мати відповідні права адміністратора."
     )
 
 
-@router.message(Command("info"))
+@router.message(F.text.regexp(r"^!help(?:@\w+)?(?:\s|$)"))
+async def group_help(m: Message):
+    await group_commands_list(m)
+
+
+@router.message(F.text.regexp(r"^!info(?:@\w+)?(?:\s|$)"))
 async def group_info(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     if not is_group_chat(m):
@@ -2583,19 +2641,48 @@ async def group_info(m: Message, bot: Bot):
     try:
         me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
         await m.answer(
-            f"👥 <b>{html.escape(m.chat.title or 'Група')}</b>\\n"
-            f"Chat ID: <code>{m.chat.id}</code>\\n"
-            f"Статус бота: <b>{html.escape(me.status)}</b>\\n"
-            f"Бот може керувати учасниками: <b>{'так' if getattr(me, 'can_restrict_members', False) else 'ні'}</b>\\n"
-            f"Бот може видаляти повідомлення: <b>{'так' if getattr(me, 'can_delete_messages', False) else 'ні'}</b>\\n"
+            f"👥 <b>{html.escape(m.chat.title or 'Група')}</b>\n"
+            f"Chat ID: <code>{m.chat.id}</code>\n"
+            f"Статус бота: <b>{html.escape(me.status)}</b>\n"
+            f"Бот може керувати учасниками: <b>{'так' if getattr(me, 'can_restrict_members', False) else 'ні'}</b>\n"
+            f"Бот може видаляти повідомлення: <b>{'так' if getattr(me, 'can_delete_messages', False) else 'ні'}</b>\n"
             f"Бот може закріплювати: <b>{'так' if getattr(me, 'can_pin_messages', False) else 'ні'}</b>"
         )
     except Exception as e:
         await m.answer("Не вдалося отримати інформацію: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("admins"))
-async def group_admins(m: Message, bot: Bot):
+@router.message(F.text.regexp(r"^!admins(?:@\w+)?(?:\s|$)"))
+async def group_bot_admins(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot):
+        return
+    rows = db.execute(
+        "SELECT user_id, level FROM group_roles WHERE chat_id=? ORDER BY level DESC, user_id",
+        (m.chat.id,),
+    ).fetchall()
+    lines = []
+    try:
+        admins = await bot.get_chat_administrators(m.chat.id)
+        owner = next((a.user for a in admins if a.status == "creator"), None)
+        if owner:
+            lines.append(f"• {html.escape(owner.full_name)} — рівень 5: {GROUP_ROLE_NAMES[5]}")
+    except Exception:
+        pass
+    for user_id, level in rows:
+        try:
+            member = await bot.get_chat_member(m.chat.id, int(user_id))
+            name = html.escape(member.user.full_name)
+        except Exception:
+            name = f"ID <code>{user_id}</code>"
+        lines.append(f"• {name} — рівень {level}: {GROUP_ROLE_NAMES[int(level)]}")
+    await m.answer(
+        "🛡 <b>Адміністратори системи бота</b>\n\n"
+        + ("\n".join(lines) if lines else "Адміністраторів бота ще не призначено.")
+    )
+
+
+@router.message(F.text.regexp(r"^!tgadmins(?:@\w+)?(?:\s|$)"))
+async def group_telegram_admins(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     if not is_group_chat(m):
         await m.answer("Команда доступна лише в групі.")
@@ -2603,17 +2690,17 @@ async def group_admins(m: Message, bot: Bot):
     try:
         admins = await bot.get_chat_administrators(m.chat.id)
         lines = [f"• {html.escape(a.user.full_name)}" + (f" (@{html.escape(a.user.username)})" if a.user.username else "") for a in admins]
-        await m.answer("🛡 <b>Адміністратори групи</b>\\n\\n" + "\\n".join(lines))
+        await m.answer("🛡 <b>Адміністратори Telegram-групи</b>\n\n" + "\n".join(lines))
     except Exception as e:
         await m.answer("Не вдалося отримати список: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("title"))
+@router.message(F.text.regexp(r"^!title(?:@\w+)?(?:\s|$)"))
 async def group_title(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await m.answer("Формат: /title Нова назва групи")
+        await m.answer("Формат: !title Нова назва групи")
         return
     try:
         await bot.set_chat_title(m.chat.id, parts[1].strip()[:128])
@@ -2622,12 +2709,12 @@ async def group_title(m: Message, bot: Bot):
         await m.answer("Не вдалося змінити назву: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("description"))
+@router.message(F.text.regexp(r"^!description(?:@\w+)?(?:\s|$)"))
 async def group_description(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Формат: /description Опис групи")
+        await m.answer("Формат: !description Опис групи")
         return
     try:
         await bot.set_chat_description(m.chat.id, parts[1].strip()[:255])
@@ -2636,29 +2723,33 @@ async def group_description(m: Message, bot: Bot):
         await m.answer("Не вдалося змінити опис: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("ban"))
+@router.message(F.text.regexp(r"^!ban(?:@\w+)?(?:\s|$)"))
 async def group_ban(m: Message, bot: Bot):
-    if not await require_group_admin(m, bot): return
-    target = replied_user(m)
+    if not await require_group_admin(m, bot):
+        return
+    target = await resolve_group_target(m, bot)
+    reason = punishment_reason(m, consume_target=not bool(m.reply_to_message))
     if not target:
-        await m.answer("Відповідай командою /ban на повідомлення учасника.")
+        await m.answer("Формат: !ban USER_ID або відповідь на повідомлення учасника.")
         return
     if target.id == m.from_user.id or target.id == (await bot.me()).id:
         await m.answer("Не можна заблокувати себе або самого бота.")
         return
     try:
         await bot.ban_chat_member(m.chat.id, target.id)
-        await m.answer(f"🚫 Учасника {html.escape(target.full_name)} заблоковано.")
+        response = f"🚫 Учасника {html.escape(target.full_name)} заблоковано."
+        if reason:
+            response += f"\nПричина: {html.escape(reason)}"
+        await m.answer(response)
     except Exception as e:
         await m.answer("Не вдалося заблокувати: " + html.escape(str(e)[:250]))
 
-
-@router.message(Command("unban"))
+@router.message(F.text.regexp(r"^!unban(?:@\w+)?(?:\s|$)"))
 async def group_unban(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].isdigit():
-        await m.answer("Формат: /unban USER_ID")
+        await m.answer("Формат: !unban USER_ID")
         return
     try:
         await bot.unban_chat_member(m.chat.id, int(parts[1]), only_if_banned=True)
@@ -2667,55 +2758,75 @@ async def group_unban(m: Message, bot: Bot):
         await m.answer("Не вдалося зняти блокування: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("kick"))
+@router.message(F.text.regexp(r"^!kick(?:@\w+)?(?:\s|$)"))
 async def group_kick(m: Message, bot: Bot):
-    if not await require_group_admin(m, bot): return
-    target = replied_user(m)
+    if not await require_group_admin(m, bot):
+        return
+    target = await resolve_group_target(m, bot)
+    reason = punishment_reason(m, consume_target=not bool(m.reply_to_message))
     if not target:
-        await m.answer("Відповідай командою /kick на повідомлення учасника.")
+        await m.answer("Формат: !kick USER_ID або відповідь на повідомлення учасника.")
         return
     try:
         await bot.ban_chat_member(m.chat.id, target.id)
         await bot.unban_chat_member(m.chat.id, target.id, only_if_banned=True)
-        await m.answer(f"👢 Учасника {html.escape(target.full_name)} видалено з групи.")
+        response = f"👢 Учасника {html.escape(target.full_name)} видалено з групи."
+        if reason:
+            response += f"\nПричина: {html.escape(reason)}"
+        await m.answer(response)
     except Exception as e:
         await m.answer("Не вдалося видалити учасника: " + html.escape(str(e)[:250]))
 
-
-@router.message(Command("mute"))
+@router.message(F.text.regexp(r"^!mute(?:@\w+)?(?:\s|$)"))
 async def group_mute(m: Message, bot: Bot):
-    if not await require_group_admin(m, bot): return
-    target = replied_user(m)
-    if not target:
-        await m.answer("Відповідай командою /mute 10хв на повідомлення учасника.")
+    if not await require_group_admin(m, bot):
         return
-    parts = (m.text or "").split(maxsplit=1)
-    seconds = parse_duration(parts[1]) if len(parts) > 1 else 3600
+    target = await resolve_group_target(m, bot)
+    payload = group_command_payload(m)
+    tokens = payload.split(maxsplit=2) if payload else []
+    if not m.reply_to_message and tokens:
+        tokens = tokens[1:]  # USER_ID
+    duration_token = tokens[0] if tokens else ""
+    reason = tokens[1].strip() if len(tokens) > 1 else ""
+    if not target:
+        await m.answer("Формат: !mute USER_ID 30хв або відповіддю на повідомлення: !mute 30хв.")
+        return
+    seconds = parse_duration(duration_token) if duration_token else None
     if not seconds or seconds < 60:
-        await m.answer("Вкажи строк, наприклад /mute 30хв (мінімум 1 хв).")
+        await m.answer(
+            "⛔ Час обов’язковий. Правильний формат:\n"
+            "!mute USER_ID 30хв\n"
+            "Або відповіддю на повідомлення: !mute 30хв\n"
+            "Одиниці: хв, г, д, м, р. Мінімум 1 хв."
+        )
         return
     until = datetime.now() + timedelta(seconds=seconds)
     try:
         await bot.restrict_chat_member(
             m.chat.id, target.id,
-            permissions=ChatPermissions(can_send_messages=False, can_send_audios=False,
+            permissions=ChatPermissions(
+                can_send_messages=False, can_send_audios=False,
                 can_send_documents=False, can_send_photos=False, can_send_videos=False,
                 can_send_video_notes=False, can_send_voice_notes=False,
                 can_send_polls=False, can_send_other_messages=False,
-                can_add_web_page_previews=False),
+                can_add_web_page_previews=False,
+            ),
             until_date=until,
         )
-        await m.answer(f"🔇 {html.escape(target.full_name)} не зможе писати до {until.strftime('%d.%m %H:%M')}.")
+        response = f"🔇 {html.escape(target.full_name)} не зможе писати до {until.strftime('%d.%m %H:%M')}."
+        if reason:
+            response += f"\nПричина: {html.escape(reason)}"
+        await m.answer(response)
     except Exception as e:
         await m.answer("Не вдалося обмежити учасника: " + html.escape(str(e)[:250]))
 
-
-@router.message(Command("unmute"))
+@router.message(F.text.regexp(r"^!unmute(?:@\w+)?(?:\s|$)"))
 async def group_unmute(m: Message, bot: Bot):
-    if not await require_group_admin(m, bot): return
-    target = replied_user(m)
+    if not await require_group_admin(m, bot):
+        return
+    target = await resolve_group_target(m, bot)
     if not target:
-        await m.answer("Відповідай командою /unmute на повідомлення учасника.")
+        await m.answer("Формат: !unmute USER_ID або відповіддю на повідомлення учасника.")
         return
     try:
         chat = await bot.get_chat(m.chat.id)
@@ -2723,18 +2834,18 @@ async def group_unmute(m: Message, bot: Bot):
             can_send_messages=True, can_send_audios=True, can_send_documents=True,
             can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
             can_send_voice_notes=True, can_send_polls=True,
-            can_send_other_messages=True, can_add_web_page_previews=True)
+            can_send_other_messages=True, can_add_web_page_previews=True,
+        )
         await bot.restrict_chat_member(m.chat.id, target.id, permissions=perms)
         await m.answer(f"🔊 Обмеження для {html.escape(target.full_name)} знято.")
     except Exception as e:
         await m.answer("Не вдалося зняти обмеження: " + html.escape(str(e)[:250]))
 
-
-@router.message(Command("purge"))
+@router.message(F.text.regexp(r"^!purge(?:@\w+)?(?:\s|$)"))
 async def group_purge(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     if not m.reply_to_message:
-        await m.answer("Відповідай командою /purge 20 на повідомлення, з якого почати видалення.")
+        await m.answer("Відповідай командою !purge 20 на повідомлення, з якого почати видалення.")
         return
     parts = (m.text or "").split(maxsplit=1)
     count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
@@ -2752,11 +2863,11 @@ async def group_purge(m: Message, bot: Bot):
     await m.answer(f"🧹 Видалено повідомлень: {deleted}.")
 
 
-@router.message(Command("pin"))
+@router.message(F.text.regexp(r"^!pin(?:@\w+)?(?:\s|$)"))
 async def group_pin(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     if not m.reply_to_message:
-        await m.answer("Відповідай /pin на повідомлення, яке потрібно закріпити.")
+        await m.answer("Відповідай !pin на повідомлення, яке потрібно закріпити.")
         return
     try:
         await bot.pin_chat_message(m.chat.id, m.reply_to_message.message_id)
@@ -2765,7 +2876,7 @@ async def group_pin(m: Message, bot: Bot):
         await m.answer("Не вдалося закріпити: " + html.escape(str(e)[:250]))
 
 
-@router.message(Command("unpin"))
+@router.message(F.text.regexp(r"^!unpin(?:@\w+)?(?:\s|$)"))
 async def group_unpin(m: Message, bot: Bot):
     if not await require_group_admin(m, bot): return
     try:
