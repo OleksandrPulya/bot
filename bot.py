@@ -3,6 +3,7 @@ import aiohttp
 import shutil
 from collections import defaultdict, deque
 import html
+import json
 import logging
 import os
 import re
@@ -161,7 +162,43 @@ CREATE TABLE IF NOT EXISTS group_roles(
 CREATE TABLE IF NOT EXISTS group_command_access(
     chat_id INTEGER NOT NULL, command TEXT NOT NULL, min_level INTEGER NOT NULL,
     changed_by INTEGER, updated_at REAL, PRIMARY KEY(chat_id, command));
+CREATE TABLE IF NOT EXISTS group_warns(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    admin_id INTEGER NOT NULL, reason TEXT, created_at REAL NOT NULL, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS group_config(
+    chat_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY(chat_id,key));
+CREATE TABLE IF NOT EXISTS group_filter_words(
+    chat_id INTEGER NOT NULL, word TEXT NOT NULL, PRIMARY KEY(chat_id,word));
+CREATE TABLE IF NOT EXISTS group_allowed_domains(
+    chat_id INTEGER NOT NULL, domain TEXT NOT NULL, PRIMARY KEY(chat_id,domain));
+CREATE TABLE IF NOT EXISTS group_audit(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, actor_id INTEGER,
+    target_id INTEGER, action TEXT NOT NULL, details TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS group_messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER,
+    username TEXT, full_name TEXT, text TEXT, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_group_messages_chat_time ON group_messages(chat_id,created_at);
+CREATE TABLE IF NOT EXISTS group_xp(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, xp INTEGER DEFAULT 0,
+    messages INTEGER DEFAULT 0, last_xp REAL DEFAULT 0, PRIMARY KEY(chat_id,user_id));
+CREATE TABLE IF NOT EXISTS group_birthdays(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, day INTEGER NOT NULL, month INTEGER NOT NULL,
+    PRIMARY KEY(chat_id,user_id));
+CREATE TABLE IF NOT EXISTS group_ideas(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    text TEXT NOT NULL, votes INTEGER DEFAULT 0, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS group_reports(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, reporter_id INTEGER NOT NULL,
+    target_id INTEGER, message_id INTEGER, reason TEXT, status TEXT DEFAULT 'open', created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS group_settings_backups(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, payload TEXT NOT NULL,
+    created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS group_achievements(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, code TEXT NOT NULL,
+    created_at REAL NOT NULL, PRIMARY KEY(chat_id,user_id,code));
 """)
+ensure_column("group_roles", "expires_at", "REAL")
 db.commit()
 
 SETTING_TITLES = {
@@ -1311,6 +1348,18 @@ async def cmd_backup(m: Message):
     target=sqlite3.connect(path)
     try: db.commit(); db.backup(target)
     finally: target.close()
+    encryption_key=os.getenv("BACKUP_ENCRYPTION_KEY", "").strip()
+    if encryption_key:
+        try:
+            from cryptography.fernet import Fernet
+            encrypted_path=path+".enc"
+            with open(path,"rb") as source: raw_backup=source.read()
+            with open(encrypted_path,"wb") as target: target.write(Fernet(encryption_key.encode()).encrypt(raw_backup))
+            os.remove(path); path=encrypted_path
+        except Exception as e:
+            if os.path.exists(path): os.remove(path)
+            await m.answer("Не вдалося зашифрувати резервну копію. Перевір BACKUP_ENCRYPTION_KEY і встановлення cryptography: "+html.escape(str(e)[:250]))
+            return
     size_bytes = os.path.getsize(path)
     db.execute("INSERT INTO backup_history(owner_id,path,created_at,size_bytes) VALUES(?,?,?,?)",
                (owner_id, path, time.time(), size_bytes)); db.commit()
@@ -1330,12 +1379,28 @@ async def cmd_restore(m: Message):
         await m.answer("Відповідай командою /restore на повідомлення з резервною копією .db.")
         return
     doc=m.reply_to_message.document
-    if not (doc.file_name or "").lower().endswith((".db",".sqlite",".sqlite3")):
-        await m.answer("Потрібен файл резервної копії SQLite (.db/.sqlite/.sqlite3).")
+    encrypted=(doc.file_name or "").lower().endswith(".enc")
+    if not encrypted and not (doc.file_name or "").lower().endswith((".db",".sqlite",".sqlite3")):
+        await m.answer("Потрібен файл резервної копії SQLite (.db/.sqlite/.sqlite3) або зашифрований .enc.")
         return
     info=await m.bot.get_file(doc.file_id)
     temp=f"restore_upload_{m.from_user.id}.db"
-    await m.bot.download_file(info.file_path,temp)
+    downloaded=temp+".enc" if encrypted else temp
+    await m.bot.download_file(info.file_path,downloaded)
+    if encrypted:
+        key=os.getenv("BACKUP_ENCRYPTION_KEY", "").strip()
+        if not key:
+            if os.path.exists(downloaded): os.remove(downloaded)
+            await m.answer("Для відновлення .enc задай ту саму BACKUP_ENCRYPTION_KEY, якою створили копію.")
+            return
+        try:
+            from cryptography.fernet import Fernet
+            with open(downloaded,"rb") as source: encrypted_data=source.read()
+            with open(temp,"wb") as target: target.write(Fernet(key.encode()).decrypt(encrypted_data))
+            os.remove(downloaded)
+        except Exception as e:
+            if os.path.exists(downloaded): os.remove(downloaded)
+            await m.answer("Не вдалося розшифрувати копію: "+html.escape(str(e)[:250])); return
     backup=f"before_restore_{m.from_user.id}_{int(time.time())}.db"
     try:
         test=sqlite3.connect(temp)
@@ -2338,9 +2403,22 @@ from aiohttp import web
 async def handle(request):
     return web.Response(text="Bot is alive")
 
+async def panel_handle(request):
+    # Optional read-only panel. Set ADMIN_PANEL_TOKEN to a long random secret.
+    expected = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+    supplied = request.query.get("token", "")
+    if not expected or not supplied or not __import__("hmac").compare_digest(expected, supplied):
+        raise web.HTTPUnauthorized(text="Unauthorized")
+    groups = db.execute("SELECT chat_id, COUNT(*) FROM group_messages GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 50").fetchall()
+    payload = {"status":"ok", "groups":[{"chat_id":int(cid),"messages":int(total)} for cid,total in groups],
+               "warnings":int(db.execute("SELECT COUNT(*) FROM group_warns WHERE active=1").fetchone()[0]),
+               "open_reports":int(db.execute("SELECT COUNT(*) FROM group_reports WHERE status='open'").fetchone()[0])}
+    return web.json_response(payload)
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle)
+    app.router.add_get("/panel", panel_handle)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -2394,7 +2472,10 @@ async def group_user_level(chat_id: int, user_id: int, bot: Bot) -> int:
             return 5
     except Exception:
         return 0
-    row = db.execute("SELECT level FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    row = db.execute("SELECT level,expires_at FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    if row and row[1] and float(row[1]) <= time.time():
+        db.execute("DELETE FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id,user_id)); db.commit()
+        return 0
     return int(row[0]) if row else 0
 
 async def require_group_admin(m: Message, bot: Bot) -> bool:
@@ -2532,7 +2613,9 @@ async def group_admin_add(m: Message, bot: Bot):
     args = (m.text or "").split()[1:]
     target_id = command_target_id(m, args)
     level_arg = next((x for x in args if x.isdigit() and int(x) in range(1,5)), None)
+    duration_arg = next((x for x in args if parse_duration(x)), None)
     new_level = int(level_arg) if level_arg else 1
+    expires_at = time.time() + parse_duration(duration_arg) if duration_arg else None
     if not target_id:
         await m.answer("Формат: !adminadd USER_ID [РІВЕНЬ 1-4] або відповідь на повідомлення."); return
     if new_level >= actor:
@@ -2541,9 +2624,10 @@ async def group_admin_add(m: Message, bot: Bot):
         member = await bot.get_chat_member(m.chat.id, target_id)
         if member.status == "creator":
             await m.answer("Власник групи вже має рівень 5."); return
-        db.execute("INSERT INTO group_roles(chat_id,user_id,level,added_by,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET level=excluded.level,added_by=excluded.added_by,created_at=excluded.created_at", (m.chat.id,target_id,new_level,m.from_user.id,time.time()))
+        db.execute("INSERT INTO group_roles(chat_id,user_id,level,added_by,created_at,expires_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET level=excluded.level,added_by=excluded.added_by,created_at=excluded.created_at,expires_at=excluded.expires_at", (m.chat.id,target_id,new_level,m.from_user.id,time.time(),expires_at))
         db.commit()
-        await m.answer(f"✅ {html.escape(member.user.full_name)} призначено: рівень {new_level} — {GROUP_ROLE_NAMES[new_level]}.")
+        expiry_text=f" до {datetime.fromtimestamp(expires_at).strftime('%d.%m %H:%M')}" if expires_at else " безстроково"
+        await m.answer(f"✅ {html.escape(member.user.full_name)} призначено: рівень {new_level} — {GROUP_ROLE_NAMES[new_level]}{expiry_text}.")
     except Exception as e:
         await m.answer("Не вдалося додати адміністратора. Перевір USER_ID та участь користувача в групі. " + html.escape(str(e)[:180]))
 
@@ -2634,7 +2718,10 @@ async def group_commands_list(m: Message):
         "<code>!purge [КІЛЬКІСТЬ]</code> — видалити повідомлення від відповіді.\n"
         "<code>!pin</code> / <code>!unpin</code> — закріпити/відкріпити повідомлення.\n\n"
         "Для команд з учасником відповідай на його повідомлення або вкажи його ID. "
-        "Бот повинен мати відповідні права адміністратора."
+        "Бот повинен мати відповідні права адміністратора.\n\n"
+        "<b>Додаткова модерація:</b> !warn, !warnings, !unwarn, !warnconfig limit/action/duration, !antireklama on/off, !anticaps on/off, !filter add/del/list, !automod links/caps/badwords/repeat/flood on/off, !slowmode 10/off, !quarantine on/off, !antibot on/off, !welcome on/off, !raid on/off, !audit, !report, !appeal.\n"
+        "<b>Учасники:</b> !profile, !top, !birthday ДД.ММ, !idea, !ideas, !ideas vote ID, !rules, !rulesaccept.\n"
+        "<b>Інструменти адміністратора:</b> !rules set ТЕКСТ, !aiadmin ask ПИТАННЯ, !summary, !gsearch СЛОВО, !gbackup, !grestore, !gpanel, !poll ПИТАННЯ | ВАРІАНТ 1 | ВАРІАНТ 2."
     )
 
 
@@ -2751,6 +2838,7 @@ async def group_ban(m: Message, bot: Bot):
         response = f"🚫 Учасника {html.escape(target.full_name)} заблоковано."
         if reason:
             response += f"\nПричина: {html.escape(reason)}"
+        group_audit(m.chat.id,m.from_user.id,"ban",target.id,reason)
         await m.answer(response)
     except Exception as e:
         await m.answer("Не вдалося заблокувати: " + html.escape(str(e)[:250]))
@@ -2852,6 +2940,7 @@ async def group_unmute(m: Message, bot: Bot):
             can_send_other_messages=True, can_add_web_page_previews=True,
         )
         await bot.restrict_chat_member(m.chat.id, target.id, permissions=perms)
+        group_audit(m.chat.id,m.from_user.id,"unmute",target.id)
         await m.answer(f"🔊 Обмеження для {html.escape(target.full_name)} знято.")
     except Exception as e:
         await m.answer("Не вдалося зняти обмеження: " + html.escape(str(e)[:250]))
@@ -2991,6 +3080,13 @@ async def main():
     global BOT_USERNAME
     if not TOKEN:
         raise RuntimeError("Не задано BOT_TOKEN у змінних середовища. Додай токен у налаштуваннях хостингу.")
+    # Linux host lock prevents accidental duplicate polling processes on the same instance.
+    try:
+        import fcntl
+        lock_file = open(os.getenv("BOT_LOCK_FILE", ".bot_instance.lock"), "w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (ImportError, BlockingIOError):
+        raise RuntimeError("Інший екземпляр бота вже працює в цьому середовищі. Залиш лише один worker/instance.")
     await start_web_server()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.me()
@@ -2999,6 +3095,482 @@ async def main():
     dp.include_router(router)
     asyncio.create_task(scheduler_loop(bot))
     await dp.start_polling(bot)
+
+# ---------------------- РОЗШИРЕНИЙ МОДУЛЬ ГРУП: БЕЗПЕКА, РЕПУТАЦІЯ, ШІ ----------------------
+GROUP_AUTOMOD_DEFAULTS = {
+    "links": "0", "caps": "0", "badwords": "0", "repeat": "0", "bot_guard": "0",
+    "flood": "0", "slowmode": "0", "raid": "0", "quarantine": "0",
+    "ai_moderation": "0", "welcome": "1", "xp": "1", "rules": "",
+    "warn_limit": "3", "warn_action": "mute", "warn_duration": "3600",
+    "raid_window": "60", "raid_threshold": "6", "raid_lock_seconds": "600",
+}
+GROUP_FLOOD_CACHE = defaultdict(deque)
+GROUP_REPEAT_CACHE = defaultdict(deque)
+GROUP_SLOW_CACHE = defaultdict(dict)
+
+
+def group_cfg(chat_id: int, key: str, default=None):
+    if default is None:
+        default = GROUP_AUTOMOD_DEFAULTS.get(key, "0")
+    row = db.execute("SELECT value FROM group_config WHERE chat_id=? AND key=?", (chat_id,key)).fetchone()
+    return row[0] if row else default
+
+
+def set_group_cfg(chat_id: int, key: str, value):
+    db.execute("INSERT INTO group_config(chat_id,key,value) VALUES(?,?,?) ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value", (chat_id,key,str(value)))
+    db.commit()
+
+
+def group_audit(chat_id: int, actor_id: int | None, action: str, target_id: int | None = None, details: str = ""):
+    db.execute("INSERT INTO group_audit(chat_id,actor_id,target_id,action,details,created_at) VALUES(?,?,?,?,?,?)",
+               (chat_id,actor_id,target_id,action,details[:1000],time.time()))
+    db.commit()
+
+
+def parse_on_off(value: str):
+    v=value.strip().lower()
+    if v in ("on","1","так","увімкнути","вкл"): return "1"
+    if v in ("off","0","ні","вимкнути","викл"): return "0"
+    return None
+
+
+def group_cmd_name(m: Message) -> str:
+    return (m.text or "").split(maxsplit=1)[0].split("@")[0].lower().lstrip("!")
+
+
+def group_payload(m: Message) -> str:
+    return re.sub(r"^!\w+(?:@\w+)?", "", m.text or "", count=1).strip()
+
+
+async def ensure_group_mod(m: Message, bot: Bot, level: int = 2) -> bool:
+    if not is_group_chat(m):
+        await m.answer("Ця команда працює лише в групах.")
+        return False
+    actor=await group_user_level(m.chat.id,m.from_user.id,bot)
+    if actor < level:
+        await m.answer(f"⛔ Потрібен рівень {level} ({GROUP_ROLE_NAMES.get(level,'адміністратор')}).")
+        return False
+    try:
+        me=await bot.get_chat_member(m.chat.id,(await bot.me()).id)
+        if me.status != "administrator":
+            await m.answer("Боту потрібні права адміністратора групи.")
+            return False
+    except Exception as e:
+        await m.answer("Не вдалося перевірити права бота: "+html.escape(str(e)[:200]))
+        return False
+    return True
+
+
+def target_from_command(m: Message, bot: Bot):
+    return resolve_group_target(m,bot)
+
+
+async def apply_warn_threshold(m: Message, bot: Bot, target_id: int, warn_count: int):
+    limit=max(1,int(group_cfg(m.chat.id,"warn_limit","3")))
+    if warn_count != limit:
+        return ""
+    action=group_cfg(m.chat.id,"warn_action","mute")
+    duration=max(60,int(group_cfg(m.chat.id,"warn_duration","3600")))
+    try:
+        if action == "ban":
+            await bot.ban_chat_member(m.chat.id,target_id)
+            return "Автоматичне покарання: бан."
+        until=datetime.now()+timedelta(seconds=duration)
+        await bot.restrict_chat_member(m.chat.id,target_id,permissions=ChatPermissions(can_send_messages=False),until_date=until)
+        return f"Автоматичне покарання: мут до {until.strftime('%d.%m %H:%M')}."
+    except Exception as e:
+        logging.warning("Warn threshold action failed: %s",e)
+        return "Не вдалося застосувати автоматичне покарання — перевір права бота."
+
+
+@router.message(F.text.regexp(r"^!(?:warn|warnings|unwarn|warnconfig|antireklama|anticaps|filter|automod|slowmode|quarantine|antibot|welcome|report|appeal|audit|profile|xp|top|birthday|idea|ideas|rules|rulesaccept|raid|aiadmin|summary|gsearch|gbackup|grestore|gpanel|suggest|poll)(?:@\w+)?(?:\s|$)"))
+async def group_extended_commands(m: Message, bot: Bot):
+    if not is_group_chat(m):
+        return
+    cmd=group_cmd_name(m)
+    payload=group_payload(m)
+    # Commands available to ordinary members.
+    if cmd == "report":
+        target=await target_from_command(m,bot)
+        reason=payload
+        if m.reply_to_message and target:
+            reason=payload
+        else:
+            parts=payload.split(maxsplit=1)
+            reason=parts[1] if len(parts)>1 else ""
+        if not reason:
+            await m.answer("Формат: !report причина (або відповідь на повідомлення порушника).")
+            return
+        db.execute("INSERT INTO group_reports(chat_id,reporter_id,target_id,message_id,reason,created_at) VALUES(?,?,?,?,?,?)",
+                   (m.chat.id,m.from_user.id,target.id if target else None,m.reply_to_message.message_id if m.reply_to_message else None,reason[:1000],time.time()))
+        db.commit(); group_audit(m.chat.id,m.from_user.id,"report",target.id if target else None,reason)
+        await m.answer("📨 Скаргу передано адміністраторам.")
+        try:
+            admins=await bot.get_chat_administrators(m.chat.id)
+            for a in admins:
+                if not a.user.is_bot:
+                    await bot.send_message(a.user.id,f"🚩 Скарга в групі {html.escape(m.chat.title or str(m.chat.id))}\nВід: <code>{m.from_user.id}</code>\nНа: <code>{target.id if target else 'не визначено'}</code>\nПричина: {html.escape(reason[:700])}")
+        except Exception: pass
+        return
+    if cmd == "appeal":
+        if not payload:
+            await m.answer("Формат: !appeal текст апеляції")
+            return
+        db.execute("INSERT INTO group_reports(chat_id,reporter_id,reason,status,created_at) VALUES(?,?,?,'appeal',?)",(m.chat.id,m.from_user.id,payload[:1000],time.time())); db.commit()
+        await m.answer("📨 Апеляцію збережено та передано адміністраторам.")
+        return
+    if cmd == "idea":
+        if not payload:
+            await m.answer("Формат: !idea текст пропозиції")
+            return
+        cur=db.execute("INSERT INTO group_ideas(chat_id,user_id,text,created_at) VALUES(?,?,?,?)",(m.chat.id,m.from_user.id,payload[:1000],time.time())); db.commit()
+        await m.answer(f"💡 Пропозицію #{cur.lastrowid} додано. Голосування: !ideas")
+        return
+    if cmd == "ideas":
+        if payload.startswith("vote "):
+            bits=payload.split()
+            if len(bits)==2 and bits[1].isdigit():
+                db.execute("UPDATE group_ideas SET votes=votes+1 WHERE chat_id=? AND id=?",(m.chat.id,int(bits[1]))); db.commit()
+                await m.answer("Голос зараховано.")
+            else: await m.answer("Формат: !ideas vote ID")
+            return
+        rows=db.execute("SELECT id,text,votes FROM group_ideas WHERE chat_id=? ORDER BY votes DESC,id DESC LIMIT 10",(m.chat.id,)).fetchall()
+        await m.answer("💡 <b>Пропозиції групи</b>\n\n"+("\n".join(f"#{i} · 👍 {v} · {html.escape(t[:180])}" for i,t,v in rows) if rows else "Поки немає пропозицій.")+"\n\nГолос: !ideas vote ID")
+        return
+    if cmd == "profile":
+        user=await target_from_command(m,bot) if (m.reply_to_message or payload) else m.from_user
+        if not user:
+            await m.answer("Не вдалося визначити учасника."); return
+        row=db.execute("SELECT xp,messages FROM group_xp WHERE chat_id=? AND user_id=?",(m.chat.id,user.id)).fetchone() or (0,0)
+        warns=db.execute("SELECT COUNT(*) FROM group_warns WHERE chat_id=? AND user_id=? AND active=1",(m.chat.id,user.id)).fetchone()[0]
+        level=int(row[0]//100)+1
+        await m.answer(f"👤 <b>{html.escape(user.full_name)}</b>\nID: <code>{user.id}</code>\nРівень: <b>{level}</b>\nXP: <b>{row[0]}</b>\nПовідомлень: <b>{row[1]}</b>\nАктивних попереджень: <b>{warns}</b>")
+        return
+    if cmd == "top":
+        rows=db.execute("SELECT user_id,xp,messages FROM group_xp WHERE chat_id=? ORDER BY xp DESC LIMIT 10",(m.chat.id,)).fetchall()
+        lines=[]
+        for i,(uid,xp,msgs) in enumerate(rows,1):
+            try: u=await bot.get_chat_member(m.chat.id,uid); name=u.user.full_name
+            except Exception: name=str(uid)
+            lines.append(f"{i}. {html.escape(name)} — {xp} XP · {msgs} повідомлень")
+        await m.answer("🏆 <b>Рейтинг учасників</b>\n\n"+("\n".join(lines) if lines else "Ще немає статистики."))
+        return
+    if cmd == "birthday":
+        bits=payload.split()
+        if len(bits)!=1 or not re.fullmatch(r"\d{2}\.\d{2}",bits[0]):
+            await m.answer("Формат: !birthday ДД.ММ (наприклад, !birthday 24.08)"); return
+        day,month=map(int,bits[0].split('.'))
+        try: datetime(2024,month,day)
+        except ValueError: await m.answer("Некоректна дата."); return
+        db.execute("INSERT INTO group_birthdays(chat_id,user_id,day,month) VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET day=excluded.day,month=excluded.month",(m.chat.id,m.from_user.id,day,month)); db.commit()
+        await m.answer("🎂 День народження збережено.")
+        return
+    if cmd == "rules":
+        if payload.lower().startswith("set "):
+            if not await ensure_group_mod(m,bot,3): return
+            set_group_cfg(m.chat.id,"rules",payload[4:].strip()[:3000])
+            await m.answer("✅ Правила групи оновлено."); return
+        rules=group_cfg(m.chat.id,"rules","")
+        await m.answer("📜 <b>Правила групи</b>\n\n"+(html.escape(rules) if rules else "Адміністратори ще не додали правила.")+"\n\nПідтвердження: !rulesaccept")
+        return
+    if cmd == "rulesaccept":
+        db.execute("INSERT INTO group_config(chat_id,key,value) VALUES(?,?,?) ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value",(m.chat.id,f"rules_accepted_{m.from_user.id}",str(time.time()))); db.commit()
+        await m.answer("✅ Ознайомлення з правилами підтверджено.")
+        return
+    if cmd == "xp":
+        state=parse_on_off(payload) if payload else None
+        if state is not None:
+            if not await ensure_group_mod(m,bot,3): return
+            set_group_cfg(m.chat.id,"xp",state); await m.answer("⭐ Нарахування XP " + ("увімкнено." if state=="1" else "вимкнено.")); return
+        await m.answer("⭐ XP нараховується автоматично за активність. Перегляд: !profile або !top. Адміністратор: !xp on/off")
+        return
+
+    # All remaining commands require moderator/administrator rights.
+    if cmd in ("warn","warnings","unwarn","warnconfig","antireklama","anticaps","filter","automod","slowmode","quarantine","antibot","welcome","audit","raid","aiadmin","summary","gsearch","gbackup","grestore","gpanel","suggest","poll"):
+        required=3 if cmd in ("warnconfig","grestore","gbackup","raid","aiadmin") else 2
+        if not await ensure_group_mod(m,bot,required): return
+
+    if cmd == "warn":
+        target=await target_from_command(m,bot)
+        if not target:
+            await m.answer("Формат: !warn @user причина або відповідь на повідомлення: !warn причина"); return
+        reason=payload
+        if not m.reply_to_message:
+            parts=payload.split(maxsplit=1); reason=parts[1] if len(parts)>1 else "Без зазначеної причини"
+        cur=db.execute("INSERT INTO group_warns(chat_id,user_id,admin_id,reason,created_at) VALUES(?,?,?,?,?)",(m.chat.id,target.id,m.from_user.id,reason[:1000],time.time())); db.commit()
+        count=db.execute("SELECT COUNT(*) FROM group_warns WHERE chat_id=? AND user_id=? AND active=1",(m.chat.id,target.id)).fetchone()[0]
+        auto=await apply_warn_threshold(m,bot,target.id,count)
+        group_audit(m.chat.id,m.from_user.id,"warn",target.id,reason)
+        await m.answer(f"⚠️ {html.escape(target.full_name)} отримав попередження #{cur.lastrowid}.\nАктивних попереджень: {count}/{group_cfg(m.chat.id,'warn_limit','3')}\nПричина: {html.escape(reason)}"+("\n"+auto if auto else ""))
+        return
+    if cmd == "warnings":
+        target=await target_from_command(m,bot)
+        if not target:
+            await m.answer("Відповідай на повідомлення учасника або вкажи його ID: !warnings USER_ID"); return
+        rows=db.execute("SELECT id,reason,created_at,admin_id FROM group_warns WHERE chat_id=? AND user_id=? AND active=1 ORDER BY created_at DESC LIMIT 20",(m.chat.id,target.id)).fetchall()
+        await m.answer(f"⚠️ <b>Попередження {html.escape(target.full_name)}</b>\n\n"+("\n".join(f"#{i} · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')} · адмін {aid}\n{html.escape(r or '')}" for i,r,ts,aid in rows) if rows else "Активних попереджень немає."))
+        return
+    if cmd == "unwarn":
+        target=await target_from_command(m,bot)
+        if not target: await m.answer("Формат: !unwarn USER_ID (або відповідь на повідомлення)."); return
+        parts=payload.split(); warn_id=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else None
+        if warn_id: db.execute("UPDATE group_warns SET active=0 WHERE chat_id=? AND user_id=? AND id=?",(m.chat.id,target.id,warn_id))
+        else: db.execute("UPDATE group_warns SET active=0 WHERE id=(SELECT id FROM group_warns WHERE chat_id=? AND user_id=? AND active=1 ORDER BY created_at DESC LIMIT 1)",(m.chat.id,target.id))
+        db.commit(); group_audit(m.chat.id,m.from_user.id,"unwarn",target.id,str(warn_id or "last")); await m.answer("✅ Попередження знято (якщо активне попередження було знайдено)." ); return
+    if cmd == "warnconfig":
+        bits=payload.split()
+        if len(bits)<2 or bits[0] not in ("limit","action","duration"):
+            await m.answer("Налаштування: !warnconfig limit 3 | !warnconfig action mute/ban | !warnconfig duration 1г"); return
+        key,val=bits[0]," ".join(bits[1:])
+        if key=="limit":
+            if not val.isdigit() or not 1<=int(val)<=20: await m.answer("Ліміт має бути 1–20."); return
+            set_group_cfg(m.chat.id,"warn_limit",val)
+        elif key=="action":
+            if val not in ("mute","ban"): await m.answer("Дія: mute або ban."); return
+            set_group_cfg(m.chat.id,"warn_action",val)
+        else:
+            sec=parse_duration(val)
+            if not sec: await m.answer("Час: 30хв, 1г, 1д."); return
+            set_group_cfg(m.chat.id,"warn_duration",sec)
+        await m.answer("✅ Налаштування Warn оновлено."); return
+    if cmd == "aiadmin" and payload.lower().startswith("ask "):
+        if not OPENAI_API_KEY:
+            await m.answer("Для ШІ-помічника потрібно налаштувати OPENAI_API_KEY."); return
+        rules=group_cfg(m.chat.id,"rules","")
+        try:
+            answer=await openai_text("Правила групи:\n"+rules+"\n\nЗапитання адміністратора: "+payload[4:],"Ти помічник адміністратора Telegram-групи. Відповідай українською, не вигадуй налаштування бота і відділяй рекомендації від фактів.")
+            await m.answer("🤖 <b>Помічник адміністратора</b>\n\n"+html.escape(answer[:3500]))
+        except Exception as e: await m.answer("ШІ недоступний: "+html.escape(str(e)[:250]))
+        return
+    if cmd == "antireklama" and payload.lower().startswith(("allow ","remove ","list")):
+        bits=payload.split(maxsplit=1); action=bits[0].lower()
+        if action=="list":
+            rows=db.execute("SELECT domain FROM group_allowed_domains WHERE chat_id=? ORDER BY domain",(m.chat.id,)).fetchall()
+            await m.answer("🌐 Дозволені домени: "+(", ".join(html.escape(x[0]) for x in rows) if rows else "немає")); return
+        if len(bits)<2: await m.answer("Формат: !antireklama allow example.com або !antireklama remove example.com"); return
+        domain=bits[1].lower().strip().removeprefix("https://").removeprefix("http://").split("/")[0].lstrip("www.")
+        if not re.fullmatch(r"[a-z0-9.-]{3,253}",domain): await m.answer("Некоректний домен."); return
+        if action=="allow": db.execute("INSERT OR IGNORE INTO group_allowed_domains(chat_id,domain) VALUES(?,?)",(m.chat.id,domain))
+        else: db.execute("DELETE FROM group_allowed_domains WHERE chat_id=? AND domain=?",(m.chat.id,domain))
+        db.commit(); await m.answer("✅ Список дозволених доменів оновлено."); return
+    if cmd in ("antireklama","anticaps","raid","aiadmin","quarantine","slowmode","automod","antibot","welcome"):
+        bits=payload.split()
+        if cmd=="antireklama": key="links"
+        elif cmd=="anticaps": key="caps"
+        elif cmd=="raid": key="raid"
+        elif cmd=="aiadmin": key="ai_moderation"
+        elif cmd=="quarantine": key="quarantine"
+        elif cmd=="antibot": key="bot_guard"
+        elif cmd=="welcome": key="welcome"
+        elif cmd=="slowmode": key="slowmode"
+        else: key=bits[0] if bits else ""
+        val=bits[-1] if bits else ""
+        if cmd=="slowmode":
+            if val.lower() in ("off","0","вимкнути"): state="0"
+            elif val.isdigit() and 0 <= int(val) <= 3600: state="1"
+            else: state=None
+        elif cmd=="automod":
+            if key not in ("links","caps","badwords","repeat","flood"): await m.answer("Модулі: links, caps, badwords, repeat, flood. Формат: !automod links on/off"); return
+            state=parse_on_off(val)
+        else: state=parse_on_off(val)
+        if state is None:
+            await m.answer(f"Формат: !{cmd} on або !{cmd} off" if cmd!="automod" else "Формат: !automod links on/off"); return
+        if cmd=="slowmode":
+            n=int(val) if state=="1" else 0
+            set_group_cfg(m.chat.id,"slowmode",n)
+        else: set_group_cfg(m.chat.id,key,state)
+        await m.answer(f"✅ {key}: {'увімкнено' if state=='1' else 'вимкнено' if cmd!='slowmode' else 'налаштовано'}."); return
+    if cmd == "filter":
+        bits=payload.split(maxsplit=1)
+        if len(bits)<2 or bits[0] not in ("add","del","list"): await m.answer("Формат: !filter add слово | !filter del слово | !filter list"); return
+        if bits[0]=="list":
+            rows=db.execute("SELECT word FROM group_filter_words WHERE chat_id=? ORDER BY word",(m.chat.id,)).fetchall(); await m.answer("🚫 Фільтр слів: "+(", ".join(html.escape(x[0]) for x in rows) if rows else "порожній")); return
+        word=bits[1].strip().lower()[:80]
+        if bits[0]=="add": db.execute("INSERT OR IGNORE INTO group_filter_words(chat_id,word) VALUES(?,?)",(m.chat.id,word)); set_group_cfg(m.chat.id,"badwords","1")
+        else: db.execute("DELETE FROM group_filter_words WHERE chat_id=? AND word=?",(m.chat.id,word))
+        db.commit(); await m.answer("✅ Фільтр оновлено."); return
+    if cmd == "audit":
+        rows=db.execute("SELECT actor_id,target_id,action,details,created_at FROM group_audit WHERE chat_id=? ORDER BY id DESC LIMIT 20",(m.chat.id,)).fetchall()
+        await m.answer("📋 <b>Журнал адміністратора</b>\n\n"+("\n".join(f"{datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')} · {a or '-'} → {t or '-'} · {html.escape(act)} · {html.escape((d or '')[:100])}" for a,t,act,d,ts in rows) if rows else "Записів поки немає.")); return
+    if cmd == "summary":
+        rows=db.execute("SELECT full_name,text FROM group_messages WHERE chat_id=? AND created_at>? ORDER BY created_at DESC LIMIT 100",(m.chat.id,time.time()-86400)).fetchall()
+        transcript="\n".join(f"{n}: {t}" for n,t in reversed(rows) if t)
+        if not transcript: await m.answer("За останню добу немає збережених текстових повідомлень."); return
+        try: answer=await openai_text("Підсумуй ключові теми, рішення, запитання та домовленості групи за останню добу. Не вигадуй фактів.\n\n"+transcript[-14000:])
+        except Exception as e: await m.answer("ШІ недоступний: "+html.escape(str(e)[:250])); return
+        await m.answer("🧠 <b>Підсумок за 24 години</b>\n\n"+html.escape(answer[:3500])); return
+    if cmd == "gsearch":
+        if not payload: await m.answer("Формат: !gsearch ключові слова"); return
+        rows=db.execute("SELECT full_name,text,created_at FROM group_messages WHERE chat_id=? AND lower(text) LIKE ? ORDER BY created_at DESC LIMIT 15",(m.chat.id,"%"+payload.lower()+"%" )).fetchall()
+        await m.answer("🔎 <b>Пошук у збереженій історії</b>\n\n"+("\n\n".join(f"{datetime.fromtimestamp(ts).strftime('%d.%m %H:%M')} · {html.escape(n or '?')}: {html.escape((t or '')[:250])}" for n,t,ts in rows) if rows else "Збігів не знайдено.")); return
+    if cmd == "gbackup":
+        rows=db.execute("SELECT key,value FROM group_config WHERE chat_id=?",(m.chat.id,)).fetchall()
+        roles=db.execute("SELECT user_id,level FROM group_roles WHERE chat_id=?",(m.chat.id,)).fetchall()
+        filters=db.execute("SELECT word FROM group_filter_words WHERE chat_id=?",(m.chat.id,)).fetchall()
+        domains=db.execute("SELECT domain FROM group_allowed_domains WHERE chat_id=?",(m.chat.id,)).fetchall()
+        payload_json=json.dumps({"config":rows,"roles":roles,"filters":[x[0] for x in filters],"domains":[x[0] for x in domains]},ensure_ascii=False)
+        db.execute("INSERT INTO group_settings_backups(chat_id,payload,created_at) VALUES(?,?,?)",(m.chat.id,payload_json,time.time())); db.commit()
+        await m.answer("💾 Резервну копію налаштувань групи створено в базі даних."); return
+    if cmd == "grestore":
+        row=db.execute("SELECT id,payload FROM group_settings_backups WHERE chat_id=? ORDER BY id DESC LIMIT 1",(m.chat.id,)).fetchone()
+        if not row: await m.answer("Резервних копій немає. Спочатку !gbackup"); return
+        data=json.loads(row[1]); db.execute("DELETE FROM group_config WHERE chat_id=?",(m.chat.id,)); db.execute("DELETE FROM group_roles WHERE chat_id=?",(m.chat.id,)); db.execute("DELETE FROM group_filter_words WHERE chat_id=?",(m.chat.id,)); db.execute("DELETE FROM group_allowed_domains WHERE chat_id=?",(m.chat.id,))
+        for k,v in data.get("config",[]): db.execute("INSERT INTO group_config(chat_id,key,value) VALUES(?,?,?)",(m.chat.id,k,v))
+        for uid,level in data.get("roles",[]): db.execute("INSERT INTO group_roles(chat_id,user_id,level,created_at) VALUES(?,?,?,?)",(m.chat.id,uid,level,time.time()))
+        for word in data.get("filters",[]): db.execute("INSERT INTO group_filter_words(chat_id,word) VALUES(?,?)",(m.chat.id,word))
+        for domain in data.get("domains",[]): db.execute("INSERT INTO group_allowed_domains(chat_id,domain) VALUES(?,?)",(m.chat.id,domain))
+        db.commit(); await m.answer("✅ Останню резервну копію налаштувань відновлено."); return
+    if cmd == "gpanel":
+        warns=db.execute("SELECT COUNT(*) FROM group_warns WHERE chat_id=? AND active=1",(m.chat.id,)).fetchone()[0]
+        reports=db.execute("SELECT COUNT(*) FROM group_reports WHERE chat_id=? AND status='open'",(m.chat.id,)).fetchone()[0]
+        msgs=db.execute("SELECT COUNT(*) FROM group_messages WHERE chat_id=? AND created_at>?",(m.chat.id,time.time()-86400)).fetchone()[0]
+        await m.answer(f"🧭 <b>Панель групи</b>\nПовідомлень за 24 год: {msgs}\nАктивних попереджень: {warns}\nВідкритих скарг: {reports}\n\n!audit · !warnings USER_ID · !gbackup · !grestore"); return
+    if cmd == "suggest":
+        await m.answer("💡 Пропозиції учасників: !idea текст · !ideas · !ideas vote ID"); return
+    if cmd == "poll":
+        if not payload: await m.answer("Формат: !poll Питання | Варіант 1 | Варіант 2"); return
+        bits=[x.strip() for x in payload.split("|")]
+        if len(bits)<3 or len(bits)>11: await m.answer("Потрібно питання та 2–10 варіантів, розділених символом |."); return
+        try: await bot.send_poll(m.chat.id,bits[0],bits[1:],is_anonymous=True)
+        except Exception as e: await m.answer("Не вдалося створити опитування: "+html.escape(str(e)[:200]))
+        return
+
+
+@router.message(F.new_chat_members)
+async def group_new_members(m: Message, bot: Bot):
+    if not is_group_chat(m): return
+    # Join-rate detector. Protection is opt-in to avoid accidental mass restrictions.
+    now=time.time(); q=GROUP_FLOOD_CACHE[(m.chat.id,"joins")]; q.append(now)
+    while q and now-q[0]>int(group_cfg(m.chat.id,"raid_window","60")): q.popleft()
+    if group_cfg(m.chat.id,"raid","0")=="1" and len(q)>=int(group_cfg(m.chat.id,"raid_threshold","6")):
+        set_group_cfg(m.chat.id,"raid_lock_until",now+int(group_cfg(m.chat.id,"raid_lock_seconds","600")))
+        for member in m.new_chat_members:
+            try: await bot.restrict_chat_member(m.chat.id,member.id,permissions=ChatPermissions(can_send_messages=False),until_date=datetime.now()+timedelta(seconds=int(group_cfg(m.chat.id,"raid_lock_seconds","600"))))
+            except Exception: pass
+        try: await m.answer("🛡 Виявлено можливий рейд. Нових учасників тимчасово поміщено в карантин.")
+        except Exception: pass
+    if group_cfg(m.chat.id,"welcome","1")=="1":
+        for member in m.new_chat_members:
+            if member.is_bot:
+                if group_cfg(m.chat.id,"bot_guard","0")=="1":
+                    try:
+                        await bot.ban_chat_member(m.chat.id,member.id)
+                        group_audit(m.chat.id,None,"antibot_ban",member.id,"Автоматичний захист від бот-акаунтів")
+                    except Exception as e: logging.warning("Could not block joining bot: %s",e)
+                continue
+            try: await m.answer(f"👋 Вітаємо, {html.escape(member.full_name)}!\nПереглянь правила: !rules")
+            except Exception: pass
+
+
+@router.message(F.chat.type.in_({"group","supergroup"}), F.text, ~F.text.startswith("!"))
+async def group_message_automod(m: Message, bot: Bot):
+    if not m.from_user or m.from_user.is_bot: return
+    text_value=m.text or ""; now=time.time(); cid=m.chat.id; uid=m.from_user.id
+    # Keep a bounded, local message archive for search and AI summaries.
+    db.execute("INSERT INTO group_messages(chat_id,user_id,username,full_name,text,created_at) VALUES(?,?,?,?,?,?)",(cid,uid,m.from_user.username,m.from_user.full_name,text_value[:4000],now))
+    xp_enabled=group_cfg(cid,"xp","1")=="1"
+    db.execute("INSERT INTO group_xp(chat_id,user_id,xp,messages,last_xp) VALUES(?,?,?,1,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET messages=messages+1,xp=xp+CASE WHEN ?=1 AND excluded.last_xp-group_xp.last_xp>60 THEN 1 ELSE 0 END,last_xp=CASE WHEN ?=1 AND excluded.last_xp-group_xp.last_xp>60 THEN excluded.last_xp ELSE group_xp.last_xp END",(cid,uid,1 if xp_enabled else 0,now,1 if xp_enabled else 0,1 if xp_enabled else 0))
+    db.execute("DELETE FROM group_messages WHERE chat_id=? AND id NOT IN (SELECT id FROM group_messages WHERE chat_id=? ORDER BY id DESC LIMIT 3000)",(cid,cid)); db.commit()
+    xp_row=db.execute("SELECT xp,messages FROM group_xp WHERE chat_id=? AND user_id=?",(cid,uid)).fetchone()
+    if xp_row:
+        for milestone,code in ((100,"messages_100"),(500,"messages_500"),(1000,"messages_1000")):
+            if xp_row[1] >= milestone and not db.execute("SELECT 1 FROM group_achievements WHERE chat_id=? AND user_id=? AND code=?",(cid,uid,code)).fetchone():
+                db.execute("INSERT OR IGNORE INTO group_achievements(chat_id,user_id,code,created_at) VALUES(?,?,?,?)",(cid,uid,code,now)); db.commit()
+                try: await m.answer(f"🏅 {html.escape(m.from_user.full_name)} отримує досягнення: {milestone} повідомлень!")
+                except Exception: pass
+    # Birthday greetings are sent only on the matching local server date.
+    today=datetime.now()
+    bday=db.execute("SELECT 1 FROM group_birthdays WHERE chat_id=? AND user_id=? AND day=? AND month=?",(cid,uid,today.day,today.month)).fetchone()
+    if bday and group_cfg(cid,"birthday_sent_"+str(uid)+"_"+today.strftime("%Y"),"")!="1":
+        set_group_cfg(cid,"birthday_sent_"+str(uid)+"_"+today.strftime("%Y"),"1")
+        await m.answer(f"🎂 З днем народження, {html.escape(m.from_user.full_name)}!")
+    # Never moderate admins/owners.
+    try:
+        member=await bot.get_chat_member(cid,uid)
+        if member.status in ("creator","administrator"): return
+    except Exception: pass
+    reason=None
+    if group_cfg(cid,"links","0")=="1" and re.search(r"(?:https?://|www\.|t\.me/|telegram\.me/)",text_value,re.I):
+        found=re.findall(r"(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})(?:/|\b)",text_value,re.I)
+        allowed=[x[0] for x in db.execute("SELECT domain FROM group_allowed_domains WHERE chat_id=?",(cid,)).fetchall()]
+        if not found or not all(any(d==a or d.endswith("."+a) for a in allowed) for d in found): reason="посилання/реклама"
+    if not reason and group_cfg(cid,"caps","0")=="1":
+        letters=[c for c in text_value if c.isalpha()]
+        if len(letters)>=12 and sum(c.isupper() for c in letters)/len(letters)>0.75: reason="надмірний CAPS"
+    if not reason and group_cfg(cid,"badwords","0")=="1":
+        words=[r[0] for r in db.execute("SELECT word FROM group_filter_words WHERE chat_id=?",(cid,)).fetchall()]
+        if any(re.search(r"(?<!\w)"+re.escape(w)+r"(?!\w)",text_value,re.I) for w in words): reason="заборонене слово"
+    if not reason and group_cfg(cid,"repeat","0")=="1":
+        q=GROUP_REPEAT_CACHE[(cid,uid)]; normalized=re.sub(r"\W+","",text_value.lower())[:500]
+        q.append((now,normalized))
+        while q and now-q[0][0]>60: q.popleft()
+        if normalized and sum(1 for _,v in q if v==normalized)>=3: reason="повторювані повідомлення"
+    if not reason and group_cfg(cid,"flood","0")=="1":
+        q=GROUP_FLOOD_CACHE[(cid,uid)]; q.append(now)
+        while q and now-q[0]>10: q.popleft()
+        if len(q)>8: reason="флуд"
+    slow=int(group_cfg(cid,"slowmode","0"))
+    if not reason and slow>0:
+        last=GROUP_SLOW_CACHE[cid].get(uid,0)
+        if now-last<slow: reason="повільний режим"
+        else: GROUP_SLOW_CACHE[cid][uid]=now
+    if reason:
+        try: await bot.delete_message(cid,m.message_id)
+        except Exception: pass
+        try: await bot.send_message(cid,f"⚠️ Повідомлення {html.escape(m.from_user.full_name)} видалено: {html.escape(reason)}.")
+        except Exception: pass
+        group_audit(cid,None,"automod",uid,reason)
+        if group_cfg(cid,"quarantine","0")=="1" and reason in ("флуд","повторювані повідомлення","заборонене слово"):
+            try: await bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=False),until_date=datetime.now()+timedelta(minutes=5))
+            except Exception: pass
+        return
+    # Optional AI review: conservative flagging only, never automatic punishment.
+    if group_cfg(cid,"ai_moderation","0")=="1" and OPENAI_API_KEY and len(text_value)>12:
+        try:
+            verdict=await openai_text("Оціни, чи містить повідомлення явну образу, погрозу або спам. Поверни лише FLAG або OK.\n"+text_value[:1200],"Ти помічник модератора. Не позначай звичайну незгоду або критику як порушення.")
+            if verdict.strip().upper().startswith("FLAG"):
+                group_audit(cid,None,"ai_flag",uid,text_value[:500])
+                admins=await bot.get_chat_administrators(cid)
+                for a in admins:
+                    if not a.user.is_bot: await bot.send_message(a.user.id,f"🤖 Можливе порушення в групі {html.escape(m.chat.title or '')}\nУчасник: <code>{uid}</code>\nПовідомлення: {html.escape(text_value[:700])}")
+        except Exception as e: logging.warning("AI moderation failed: %s",e)
+
+
+@router.message(Command("appeal"))
+async def private_appeal(m: Message, bot: Bot):
+    # A banned member can appeal privately after starting the bot: /appeal CHAT_ID reason.
+    if m.chat.type != "private": return
+    parts=(m.text or "").split(maxsplit=2)
+    if len(parts)<3 or not parts[1].lstrip("-").isdigit():
+        await m.answer("Формат: /appeal CHAT_ID текст апеляції. Спочатку відкрий приватний чат із ботом і натисни Start."); return
+    chat_id=int(parts[1]); reason=parts[2][:1000]
+    db.execute("INSERT INTO group_reports(chat_id,reporter_id,reason,status,created_at) VALUES(?,?,?,'appeal',?)",(chat_id,m.from_user.id,reason,time.time())); db.commit()
+    sent=0
+    try:
+        admins=await bot.get_chat_administrators(chat_id)
+        for a in admins:
+            if not a.user.is_bot:
+                try:
+                    await bot.send_message(a.user.id,f"📨 <b>Апеляція на блокування</b>\nГрупа: <code>{chat_id}</code>\nКористувач: <code>{m.from_user.id}</code>\nТекст: {html.escape(reason)}")
+                    sent+=1
+                except Exception: pass
+    except Exception as e:
+        logging.warning("Could not deliver appeal: %s",e)
+    await m.answer("📨 Апеляцію збережено. Сповіщення адміністраторам надіслано." if sent else "📨 Апеляцію збережено в базі, але бот не зміг доставити сповіщення адміністраторам. Переконайся, що бот є в групі й адміністратори відкривали з ним приватний чат.")
+
+
+@router.message(Command("health"))
+async def cmd_health(m: Message):
+    if m.chat.type != "private": return
+    try:
+        import psutil
+        cpu=psutil.cpu_percent(interval=0.1); ram=psutil.virtual_memory().percent
+        extra=f"CPU: {cpu}% · RAM: {ram}%"
+    except Exception: extra="CPU/RAM: встанови psutil для розширеного моніторингу"
+    await m.answer(f"🖥 <b>Стан бота</b>\nБаза даних: доступна\nЧас роботи процесу: {int(time.time()-START_TIME)} с\n{extra}")
+
+
+START_TIME=time.time()
 
 if __name__ == "__main__":
     asyncio.run(main())
