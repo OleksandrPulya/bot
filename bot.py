@@ -2447,11 +2447,22 @@ def command_target_id(m: Message, args: list[str]):
         return int(args[0])
     if args and args[0].startswith("@"):
         username = args[0].lstrip("@").lower()
+        # Telegram Bot API не вміє напряму перетворювати довільний @username
+        # на user_id. Шукаємо ID серед контактів і раніше збережених повідомлень.
         row = db.execute(
             "SELECT user_id FROM contacts WHERE lower(username)=? AND user_id IS NOT NULL "
-            "ORDER BY updated_at DESC LIMIT 1",
-            (username,),
+            "AND chat_id=? ORDER BY updated_at DESC LIMIT 1",
+            (username, m.chat.id),
         ).fetchone()
+        if not row:
+            try:
+                row = db.execute(
+                    "SELECT from_id FROM messages WHERE chat_id=? AND lower(ltrim(from_username,'@'))=? "
+                    "AND from_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                    (m.chat.id, username),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
         if row:
             return int(row[0])
     return None
@@ -2826,7 +2837,11 @@ async def group_unmute(m: Message, bot: Bot):
         return
     target = await resolve_group_target(m, bot)
     if not target:
-        await m.answer("Формат: !unmute USER_ID або відповіддю на повідомлення учасника.")
+        await m.answer(
+            "Не вдалося визначити учасника за цим @username. "
+            "Спробуй відповісти на його повідомлення командою !unmute або вкажи USER_ID. "
+            "@username працює, якщо бот уже зберіг його ID з попередніх повідомлень."
+        )
         return
     try:
         chat = await bot.get_chat(m.chat.id)
