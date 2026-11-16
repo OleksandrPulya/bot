@@ -2788,7 +2788,7 @@ async def group_commands_list(m: Message):
         "<code>!pin</code> / <code>!unpin</code> — закріпити/відкріпити повідомлення.\n\n"
         "Для команд з учасником: відповідь на його повідомлення, числовий Telegram ID або @username (якщо бот уже бачив цього користувача в групі). "
         "Профіль відкривається навіть без username. Бот повинен мати відповідні права адміністратора.\n\n"
-        "<b>Додаткова модерація:</b> !warn, !warnings, !unwarn, !warnconfig limit/action/duration, !antireklama on/off, !anticaps on/off, !filter add/del/list, !automod links/caps/badwords/repeat/flood on/off, !slowmode 10/off, !quarantine on/off, !antibot on/off, !welcome on/off, !raid on/off, !audit, !report, !appeal.\n"
+        "<b>Додаткова модерація:</b> !warn, !warnings, !unwarn, !warnconfig limit/action/duration, !antireklama on/off, !anticaps on/off, !filter add/del/list, !automod links/caps/badwords/repeat/flood on/off, !slowmode 10/off, !quarantine on/off, !antibot on/off, !welcome ТЕКСТ / on / off / clear (рівень 4), !raid on/off, !audit, !report, !appeal.\n"
         "<b>Учасники:</b> !profile, !top, !birthday ДД.ММ, !idea, !ideas, !ideas vote ID, !rules, !rulesaccept.\n"
         "<b>Інструменти адміністратора:</b> !rules set ТЕКСТ, !aiadmin ask ПИТАННЯ, !summary, !gsearch СЛОВО, !gbackup, !grestore, !gpanel, !poll ПИТАННЯ | ВАРІАНТ 1 | ВАРІАНТ 2."
     )
@@ -3169,7 +3169,7 @@ async def main():
 GROUP_AUTOMOD_DEFAULTS = {
     "links": "0", "caps": "0", "badwords": "0", "repeat": "0", "bot_guard": "0",
     "flood": "0", "slowmode": "0", "raid": "0", "quarantine": "0",
-    "ai_moderation": "0", "welcome": "1", "xp": "1", "rules": "",
+    "ai_moderation": "0", "welcome": "0", "welcome_text": "", "xp": "1", "rules": "",
     "warn_limit": "3", "warn_action": "mute", "warn_duration": "3600",
     "raid_window": "60", "raid_threshold": "6", "raid_lock_seconds": "600",
 }
@@ -3360,7 +3360,7 @@ async def group_extended_commands(m: Message, bot: Bot):
 
     # All remaining commands require moderator/administrator rights.
     if cmd in ("warn","warnings","unwarn","warnconfig","antireklama","anticaps","filter","automod","slowmode","quarantine","antibot","welcome","audit","raid","aiadmin","summary","gsearch","gbackup","grestore","gpanel","suggest","poll"):
-        required=3 if cmd in ("warnconfig","grestore","gbackup","raid","aiadmin") else 2
+        required=4 if cmd=="welcome" else (3 if cmd in ("warnconfig","grestore","gbackup","raid","aiadmin") else 2)
         if not await ensure_group_mod(m,bot,required): return
 
     if cmd == "warn":
@@ -3426,7 +3426,44 @@ async def group_extended_commands(m: Message, bot: Bot):
         if action=="allow": db.execute("INSERT OR IGNORE INTO group_allowed_domains(chat_id,domain) VALUES(?,?)",(m.chat.id,domain))
         else: db.execute("DELETE FROM group_allowed_domains WHERE chat_id=? AND domain=?",(m.chat.id,domain))
         db.commit(); await m.answer("✅ Список дозволених доменів оновлено."); return
-    if cmd in ("antireklama","anticaps","raid","aiadmin","quarantine","slowmode","automod","antibot","welcome"):
+    if cmd == "welcome":
+        raw = payload.strip()
+        low = raw.lower()
+        if low in ("off", "0", "вимкнути", "disable"):
+            set_group_cfg(m.chat.id, "welcome", "0")
+            await m.answer("🔕 Привітання нових учасників вимкнено.")
+            return
+        if low in ("on", "1", "увімкнути", "enable"):
+            if not group_cfg(m.chat.id, "welcome_text", "").strip():
+                await m.answer("Спочатку додай власний текст: !welcome текст привітання")
+                return
+            set_group_cfg(m.chat.id, "welcome", "1")
+            await m.answer("✅ Власне привітання увімкнено.")
+            return
+        if low in ("clear", "delete", "очистити", "видалити"):
+            set_group_cfg(m.chat.id, "welcome_text", "")
+            set_group_cfg(m.chat.id, "welcome", "0")
+            await m.answer("🗑 Текст привітання видалено, автоматичні привітання вимкнено.")
+            return
+        if not raw:
+            current = group_cfg(m.chat.id, "welcome_text", "").strip()
+            state = "увімкнено" if group_cfg(m.chat.id, "welcome", "0") == "1" else "вимкнено"
+            await m.answer(
+                f"👋 <b>Налаштування привітання</b>\nСтан: {state}\n"
+                f"Текст: {html.escape(current[:1000]) if current else 'не задано'}\n\n"
+                "Команди (лише власник або адміністратор рівня 4):\n"
+                "<code>!welcome ТЕКСТ</code> — задати/замінити привітання\n"
+                "<code>!welcome on</code> — увімкнути\n"
+                "<code>!welcome off</code> — вимкнути\n"
+                "<code>!welcome clear</code> — видалити текст."
+            )
+            return
+        set_group_cfg(m.chat.id, "welcome_text", raw[:3500])
+        set_group_cfg(m.chat.id, "welcome", "1")
+        await m.answer("✅ Текст привітання збережено й увімкнено.")
+        return
+
+    if cmd in ("antireklama","anticaps","raid","aiadmin","quarantine","slowmode","automod","antibot"):
         bits=payload.split()
         if cmd=="antireklama": key="links"
         elif cmd=="anticaps": key="caps"
@@ -3434,7 +3471,6 @@ async def group_extended_commands(m: Message, bot: Bot):
         elif cmd=="aiadmin": key="ai_moderation"
         elif cmd=="quarantine": key="quarantine"
         elif cmd=="antibot": key="bot_guard"
-        elif cmd=="welcome": key="welcome"
         elif cmd=="slowmode": key="slowmode"
         else: key=bits[0] if bits else ""
         val=bits[-1] if bits else ""
@@ -3522,17 +3558,21 @@ async def group_new_members(m: Message, bot: Bot):
             except Exception: pass
         try: await m.answer("🛡 Виявлено можливий рейд. Нових учасників тимчасово поміщено в карантин.")
         except Exception: pass
-    if group_cfg(m.chat.id,"welcome","1")=="1":
-        for member in m.new_chat_members:
-            if member.is_bot:
-                if group_cfg(m.chat.id,"bot_guard","0")=="1":
-                    try:
-                        await bot.ban_chat_member(m.chat.id,member.id)
-                        group_audit(m.chat.id,None,"antibot_ban",member.id,"Автоматичний захист від бот-акаунтів")
-                    except Exception as e: logging.warning("Could not block joining bot: %s",e)
-                continue
-            try: await m.answer(f"👋 Вітаємо, {html.escape(member.full_name)}!\nПереглянь правила: !rules")
-            except Exception: pass
+    welcome_enabled = group_cfg(m.chat.id, "welcome", "0") == "1"
+    welcome_text = group_cfg(m.chat.id, "welcome_text", "").strip()
+    for member in m.new_chat_members:
+        if member.is_bot:
+            if group_cfg(m.chat.id,"bot_guard","0")=="1":
+                try:
+                    await bot.ban_chat_member(m.chat.id,member.id)
+                    group_audit(m.chat.id,None,"antibot_ban",member.id,"Автоматичний захист від бот-акаунтів")
+                except Exception as e: logging.warning("Could not block joining bot: %s",e)
+            continue
+        if welcome_enabled and welcome_text:
+            try:
+                await m.answer(welcome_text.replace("{name}", html.escape(member.full_name)))
+            except Exception as e:
+                logging.warning("Could not send configured welcome message: %s", e)
 
 
 @router.message(F.chat.type.in_({"group","supergroup"}), F.text, ~F.text.startswith("!"))
