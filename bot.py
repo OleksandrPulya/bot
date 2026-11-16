@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import sqlite3
-import tempfile
 import time
 from datetime import datetime, timedelta
 
@@ -19,6 +18,7 @@ from aiogram.types import (
     BusinessConnection,
     BusinessMessagesDeleted,
     CallbackQuery,
+    ChatPermissions,
     FSInputFile,
     InlineKeyboardMarkup,
     Message,
@@ -35,58 +35,9 @@ BOT_USERNAME = ""  # заповнюється під час запуску в ma
 FLOOD_WINDOWS = defaultdict(deque)
 SPAM_RECENT = defaultdict(deque)
 
-# ---------------------- ГОЛОСОВІ ПОВІДОМЛЕННЯ (Whisper) ----------------------
-# Потрібно: pip install faster-whisper   (і системний ffmpeg для декодування .ogg)
-# Модель багатомовна, авто-визначає мову — українську, російську й англійську
-# розпізнає "з коробки", без додаткових налаштувань.
-_whisper_model = None
-
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        # tiny — найшвидша багатомовна модель; int8 зменшує навантаження на CPU/RAM.
-        _whisper_model = WhisperModel(
-            "tiny", device="cpu", compute_type="int8", cpu_threads=2, num_workers=1
-        )
-    return _whisper_model
-
-
-async def transcribe_voice(bot: Bot, file_id: str):
-    file = await bot.get_file(file_id)
-    tmp_path = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False).name
-    await bot.download_file(file.file_path, tmp_path)
-
-    def _run():
-        model = get_whisper_model()
-        segments, info = model.transcribe(
-            tmp_path,
-            language=None,
-            task="transcribe",
-            beam_size=1,
-            best_of=1,
-            temperature=0,
-            condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 400},
-        )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        return text, info.language
-
-    try:
-        # Жорсткий ліміт: модель + розпізнавання мають завершитися за 30 секунд.
-        text, lang = await asyncio.wait_for(asyncio.to_thread(_run), timeout=30)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-    return text, lang
-
-
 # ---------------------- БАЗА ДАНИХ ----------------------
-db = sqlite3.connect("bot.db")
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
+db = sqlite3.connect(DB_PATH)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS connections(
     conn_id TEXT PRIMARY KEY, owner_id INTEGER, owner_chat_id INTEGER);
@@ -190,7 +141,6 @@ ensure_column("settings", "autoreply_text", "TEXT DEFAULT ''")
 ensure_column("settings", "autoreply_start", "TEXT DEFAULT ''")
 ensure_column("settings", "autoreply_end", "TEXT DEFAULT ''")
 ensure_column("settings", "cleanup_days", "INTEGER DEFAULT 30")
-ensure_column("settings", "voice_transcribe_enabled", "INTEGER DEFAULT 0")
 ensure_column("settings", "weekly_report_enabled", "INTEGER DEFAULT 0")
 ensure_column("scheduled_tasks", "recurrence", "TEXT")
 ensure_column("scheduled_tasks", "weekday", "INTEGER")
@@ -213,7 +163,6 @@ SETTING_TITLES = {
     "delete_cmd": "Видаляти мою команду !мут",
     "dnd_enabled": "Режим «не турбувати»",
     "autoreply_enabled": "Автовідповідь",
-    "voice_transcribe_enabled": "🎙 Розпізнавання голосових",
     "weekly_report_enabled": "📊 Тижневий звіт",
     "antispam_enabled": "🛡 Антиспам",
     "vip_only": "⭐ Сповіщення лише від VIP",
@@ -326,7 +275,6 @@ HELP_PAGES = {
         "⭐ <b>VIP-контакти:</b> позначає важливих співрозмовників, чиї сповіщення проходять крізь режим «Не турбувати».\n"
         "🌙 <b>Фільтрація сповіщень:</b> тихий режим, режим лише VIP, ігнорування чатів та список дозволених контактів.\n"
         "🔑 <b>Ключові слова:</b> шукає задані слова у вхідних текстах і надсилає сповіщення; для слова можна задати чати, де воно діє або ігнорується.\n"
-        "🎙 <b>Голосові:</b> за ввімкненої опції розпізнає голосові повідомлення за допомогою Faster-Whisper (потрібні встановлені залежності та ffmpeg).\n"
         "🤖 <b>Автовідповідь:</b> відповідає контакту не частіше одного разу на день; можна задати окремий текст для конкретного контакту або загальний текст і часовий інтервал.\n"
         "📝 <b>Нотатки та шаблони:</b> зберігає нотатки й шаблони відповідей, які можна вставляти командами.\n"
         "⏰ <b>Нагадування та відкладені повідомлення:</b> одноразові й повторювані нагадування, а також надсилання повідомлення пізніше.\n"
@@ -338,7 +286,7 @@ HELP_PAGES = {
         "• Повідомлення, фото чи відео з обмеженнями перегляду можуть бути недоступні.\n"
         "• Бот не гарантує отримання кожної події: це залежить від Telegram, дозволів, доступності сервера та роботи самого бота.\n"
         "• Мут реалізований через видалення повідомлень після отримання події, тому повідомлення може короткочасно з'явитися.\n"
-        "• Розпізнавання голосу потребує Faster-Whisper та ffmpeg; функції ШІ потребують налаштованого OPENAI_API_KEY.\n"
+        "• Голосові повідомлення не перетворюються на текст; функції ШІ потребують налаштованого OPENAI_API_KEY.\n"
         "• Якщо сервер або бот вимкнений, події та заплановані дії можуть бути пропущені."
     ),
     "cmds": (
@@ -1409,7 +1357,7 @@ async def cmd_restore(m: Message):
             CREATE TABLE IF NOT EXISTS fraud_alerts(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,chat_id INTEGER,msg_id INTEGER,reason TEXT,content TEXT,created_at REAL);
             CREATE TABLE IF NOT EXISTS backup_history(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,path TEXT,created_at REAL,size_bytes INTEGER);
             """)
-            for table,col,decl in [("settings","antiflood_limit","INTEGER DEFAULT 0"),("settings","autotranslate_enabled","INTEGER DEFAULT 0"),("settings","autotranslate_lang","TEXT DEFAULT 'uk'"),("settings","autonote_keyword","TEXT DEFAULT ''"),("settings","antispam_enabled","INTEGER DEFAULT 0"),("settings","vip_only","INTEGER DEFAULT 0"),("settings","auto_delete_hours","INTEGER DEFAULT 0"),("settings","auto_backup_enabled","INTEGER DEFAULT 0"),("settings","dnd_enabled","INTEGER DEFAULT 0"),("settings","dnd_start","TEXT DEFAULT '23:00'"),("settings","dnd_end","TEXT DEFAULT '08:00'"),("settings","autoreply_enabled","INTEGER DEFAULT 0"),("settings","autoreply_text","TEXT DEFAULT ''"),("settings","autoreply_start","TEXT DEFAULT ''"),("settings","autoreply_end","TEXT DEFAULT ''"),("settings","cleanup_days","INTEGER DEFAULT 30"),("settings","voice_transcribe_enabled","INTEGER DEFAULT 0"),("settings","weekly_report_enabled","INTEGER DEFAULT 0"),("muted","until","REAL"),("muted","chat_name","TEXT"),("scheduled_tasks","recurrence","TEXT"),("scheduled_tasks","weekday","INTEGER"),("scheduled_tasks","hhmm","TEXT"),("messages","from_id","INTEGER"),("messages","from_username","TEXT"),("messages","created_at","REAL DEFAULT 0"),("stats_log","chat_id","INTEGER")]:
+            for table,col,decl in [("settings","antiflood_limit","INTEGER DEFAULT 0"),("settings","autotranslate_enabled","INTEGER DEFAULT 0"),("settings","autotranslate_lang","TEXT DEFAULT 'uk'"),("settings","autonote_keyword","TEXT DEFAULT ''"),("settings","antispam_enabled","INTEGER DEFAULT 0"),("settings","vip_only","INTEGER DEFAULT 0"),("settings","auto_delete_hours","INTEGER DEFAULT 0"),("settings","auto_backup_enabled","INTEGER DEFAULT 0"),("settings","dnd_enabled","INTEGER DEFAULT 0"),("settings","dnd_start","TEXT DEFAULT '23:00'"),("settings","dnd_end","TEXT DEFAULT '08:00'"),("settings","autoreply_enabled","INTEGER DEFAULT 0"),("settings","autoreply_text","TEXT DEFAULT ''"),("settings","autoreply_start","TEXT DEFAULT ''"),("settings","autoreply_end","TEXT DEFAULT ''"),("settings","cleanup_days","INTEGER DEFAULT 30"),("settings","weekly_report_enabled","INTEGER DEFAULT 0"),("muted","until","REAL"),("muted","chat_name","TEXT"),("scheduled_tasks","recurrence","TEXT"),("scheduled_tasks","weekday","INTEGER"),("scheduled_tasks","hhmm","TEXT"),("messages","from_id","INTEGER"),("messages","from_username","TEXT"),("messages","created_at","REAL DEFAULT 0"),("stats_log","chat_id","INTEGER")]:
                 ensure_column(table,col,decl)
             db.commit()
         except Exception:
@@ -1611,11 +1559,18 @@ async def cb_canceltask(c: CallbackQuery):
     await c.answer("Скасовано")
 
 
-def help_commands_keyboard(second_page: bool = False) -> InlineKeyboardMarkup:
+def help_commands_keyboard(category: str = "root") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    if not second_page:
-        kb.button(text="Наступна сторінка →", callback_data="help:cmds2")
-    kb.button(text="« Назад", callback_data="menu:main")
+    if category == "root":
+        kb.button(text="👤 Команди в особистих чатах", callback_data="help:cmds_private")
+        kb.button(text="🤖 Команди в чаті з ботом", callback_data="help:cmds_bot")
+        kb.button(text="👥 Команди в групах", callback_data="help:cmds_group")
+        kb.button(text="« Назад", callback_data="menu:main")
+    else:
+        if category == "cmds_bot":
+            kb.button(text="Наступна сторінка →", callback_data="help:cmds_bot2")
+        kb.button(text="« До всіх команд", callback_data="help:cmds")
+        kb.button(text="🏠 Головне меню", callback_data="menu:main")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1623,26 +1578,53 @@ def help_commands_keyboard(second_page: bool = False) -> InlineKeyboardMarkup:
 @router.callback_query(F.data.startswith("help:"))
 async def cb_help(c: CallbackQuery, bot: Bot):
     page = c.data.split(":", 1)[1]
-    if page in ("cmds", "cmds1", "cmds2"):
+    if page == "cmds":
+        await c.message.edit_text(
+            "📚 <b>Команди</b>\\n\\nОбери, де саме потрібно виконати команду:",
+            reply_markup=help_commands_keyboard("root"),
+        )
+        await c.answer()
+        return
+    if page in ("cmds_private", "cmds_bot", "cmds_bot2", "cmds_group"):
         raw = HELP_PAGES["cmds"]
-        # Split on line boundaries so no command description is cut in half.
-        lines = raw.splitlines()
-        pages = []
-        chunk = ""
-        for line in lines:
-            candidate = (chunk + "\n" + line).strip()
-            if len(candidate) > 3500 and chunk:
-                pages.append(chunk)
-                chunk = line
-            else:
-                chunk = candidate
-        if chunk:
-            pages.append(chunk)
-        if page == "cmds2":
-            idx = min(1, len(pages) - 1)
-            await c.message.edit_text(pages[idx], reply_markup=help_commands_keyboard(True))
+        if page == "cmds_private":
+            begin = raw.find("<b>🔇 Команди в особистих чатах</b>")
+            finish = raw.find("<b>🤖 Команди в чаті з ботом</b>")
+            body = raw[begin:finish].strip()
+        elif page in ("cmds_bot", "cmds_bot2"):
+            begin = raw.find("<b>🤖 Команди в чаті з ботом</b>")
+            bot_commands = raw[begin:].strip()
+            lines = bot_commands.splitlines()
+            chunks, chunk = [], ""
+            for line in lines:
+                candidate = (chunk + "\\n" + line).strip()
+                if len(candidate) > 3500 and chunk:
+                    chunks.append(chunk)
+                    chunk = line
+                else:
+                    chunk = candidate
+            if chunk: chunks.append(chunk)
+            body = chunks[1] if page == "cmds_bot2" and len(chunks) > 1 else chunks[0]
         else:
-            await c.message.edit_text(pages[0], reply_markup=help_commands_keyboard(False))
+            body = (
+                "👥 <b>Команди керування групою</b>\\n\\n"
+                "<code>/help</code> — довідка з керування групою.\\n"
+                "<code>/info</code> — інформація про групу та права бота.\\n"
+                "<code>/admins</code> — список адміністраторів.\\n"
+                "<code>/title НАЗВА</code> — змінити назву групи.\\n"
+                "<code>/description ТЕКСТ</code> — змінити опис групи.\\n"
+                "<code>/ban</code> — заблокувати учасника (відповіддю на його повідомлення).\\n"
+                "<code>/unban USER_ID</code> — розблокувати учасника.\\n"
+                "<code>/kick</code> — видалити учасника (відповіддю на повідомлення).\\n"
+                "<code>/mute 10m</code> — заборонити писати на час (відповіддю).\\n"
+                "<code>/unmute</code> — зняти обмеження (відповіддю).\\n"
+                "<code>/purge 20</code> — видалити до 20 повідомлень, починаючи з відповіді.\\n"
+                "<code>/pin</code> — закріпити повідомлення (відповіддю).\\n"
+                "<code>/unpin</code> — відкріпити повідомлення (відповіддю).\\n\\n"
+                "Бот має бути адміністратором із відповідними правами. Команди модерації доступні лише адміністраторам групи."
+            )
+        menu_category = "cmds_bot" if page == "cmds_bot" else page
+        await c.message.edit_text(body, reply_markup=help_commands_keyboard(menu_category))
         await c.answer()
         return
     text = HELP_PAGES[page].replace("{bot_username}", (await bot.me()).username)
@@ -1981,26 +1963,6 @@ async def handle_owner_command(m: Message, bot: Bot, owner_id: int, owner_chat: 
             pass
 
 
-# Звичайні приватні чати з ботом: відповідаємо текстом на отримане голосове.
-@router.message(F.voice)
-async def on_private_voice(m: Message, bot: Bot):
-    status = await m.answer("🎙 Отримав голосове. Завантажую модель і розпізнаю мовлення…")
-    try:
-        voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
-        if voice_text:
-            await status.edit_text(
-                "📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)
-            )
-        else:
-            await status.edit_text("Не вдалося розпізнати мовлення. Спробуй надіслати голосове чіткіше й без сильного шуму.")
-    except asyncio.TimeoutError:
-        logging.error("Whisper timeout while transcribing private voice message")
-        await status.edit_text("⏳ Не вдалося розпізнати голосове за 30 секунд. Спробуй коротше повідомлення або повтори трохи пізніше.")
-    except Exception as e:
-        logging.exception("Помилка розпізнавання голосового в приватному чаті")
-        await status.edit_text("⚠️ Не вдалося обробити голосове: " + html.escape(str(e)[:350]))
-
-
 # ---------------------- BUSINESS-ПОДІЇ ----------------------
 @router.business_connection()
 async def on_connection(c: BusinessConnection, bot: Bot):
@@ -2031,186 +1993,6 @@ async def on_message(m: Message, bot: Bot):
     if m.from_user and m.from_user.id == owner_id:
         await handle_owner_command(m, bot, owner_id, owner_chat)
         return
-
-    # Автоматичне розпізнавання голосових у чатах, підключених через Telegram Business.
-    if m.voice:
-        progress = None
-        try:
-            progress = await bot.send_message(
-                m.chat.id, "🎙 Розпізнаю голосове повідомлення…",
-                business_connection_id=m.business_connection_id,
-            )
-            voice_text, lang = await transcribe_voice(bot, m.voice.file_id)
-            reply = ("📝 <b>Текст із голосового повідомлення:</b>\n\n" + html.escape(voice_text)) if voice_text else "Не вдалося розпізнати мовлення в цьому голосовому повідомленні."
-            await bot.edit_message_text(
-                reply, chat_id=m.chat.id, message_id=progress.message_id,
-                business_connection_id=m.business_connection_id,
-            )
-        except asyncio.TimeoutError:
-            logging.error("Whisper timeout while transcribing business voice message")
-            if progress:
-                await bot.edit_message_text(
-                    "⏳ Не вдалося розпізнати голосове за 30 секунд. Спробуй коротше повідомлення або повтори трохи пізніше.",
-                    chat_id=m.chat.id, message_id=progress.message_id,
-                    business_connection_id=m.business_connection_id,
-                )
-        except Exception as e:
-            logging.exception("Помилка розпізнавання голосового в бізнес-чаті")
-            try:
-                error_text = "⚠️ Не вдалося обробити голосове: " + html.escape(str(e)[:300])
-                if progress:
-                    await bot.edit_message_text(
-                        error_text, chat_id=m.chat.id, message_id=progress.message_id,
-                        business_connection_id=m.business_connection_id,
-                    )
-                else:
-                    await bot.send_message(m.chat.id, error_text, business_connection_id=m.business_connection_id)
-            except Exception:
-                logging.exception("Не вдалося надіслати повідомлення про помилку розпізнавання")
-
-    remember_contact(owner_id, m)
-
-    if db.execute(
-        "SELECT 1 FROM ignored_chats WHERE owner_id=? AND chat_id=?",
-        (owner_id, m.chat.id),
-    ).fetchone():
-        return
-
-    # Whitelist is opt-in: if at least one contact is listed, only those contacts trigger alerts.
-    allowed_count = db.execute("SELECT COUNT(*) FROM whitelist WHERE owner_id=?", (owner_id,)).fetchone()[0]
-    if allowed_count and not db.execute("SELECT 1 FROM whitelist WHERE owner_id=? AND chat_id=?", (owner_id,m.chat.id)).fetchone():
-        return
-
-    if is_muted(owner_id, m.chat.id):
-        await bot.delete_business_messages(m.business_connection_id, [m.message_id])
-        return
-
-    db.execute(
-        "INSERT INTO stats_log(owner_id, event, ts, chat_id) VALUES(?,?,?,?)",
-        (owner_id, "received", time.time(), m.chat.id),
-    )
-    db.commit()
-
-    content = m.text or m.caption or ""
-    # Пасивний антифрод: лише попереджає власника, не блокує повідомлення автоматично.
-    if content:
-        fraud_patterns = [
-            (r"https?://[^\s]+", "Повідомлення містить посилання — перевір домен перед відкриттям"),
-            (r"(?i)(терміново|негайно).{0,50}(переказ|оплат|картк|парол|код)", "Терміновий запит грошей або платіжних даних"),
-            (r"(?i)(код підтвердження|код з sms|пароль|seed phrase|фразу відновлення)", "Запит коду, пароля або фрази відновлення"),
-            (r"(?i)(виграв|виграш|приз).{0,60}(оплат|комісі|посилан)", "Можлива шахрайська схема з призом або комісією"),
-        ]
-        for pattern, reason in fraud_patterns:
-            if re.search(pattern, content):
-                db.execute("INSERT INTO fraud_alerts(owner_id,chat_id,msg_id,reason,content,created_at) VALUES(?,?,?,?,?,?)",
-                           (owner_id, m.chat.id, m.message_id, reason, content[:2000], time.time()))
-                db.commit()
-                await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "⚠️ Можливий ризик шахрайства", reason) +
-                    "\n\n" + html.escape(content[:1500]) + "\n\nНе відкривай підозрілі посилання та не передавай коди/паролі.")
-                break
-    # Автоматична нотатка за ключовим словом
-    auto_note = get_setting_value(owner_id, "autonote_keyword") or ""
-    if content and auto_note and auto_note.lower() in content.lower():
-        db.execute("INSERT INTO notes(owner_id,text,created_at) VALUES(?,?,?)",
-                   (owner_id, f"[{m.chat.full_name or m.chat.id}] {content}", time.time()))
-        db.commit()
-        await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Автоматично збережено нотатку", f"Збіг: {auto_note}")
-
-    # Автоматичне тегування контакту за ключовим словом
-    tag_rule=db.execute("SELECT value FROM auto_rules WHERE owner_id=? AND kind='tag' AND enabled=1",(owner_id,)).fetchone()
-    if content and tag_rule and "|" in tag_rule[0]:
-        tag_word,tag_name=tag_rule[0].split("|",1)
-        if tag_word.lower() in content.lower():
-            db.execute("INSERT OR REPLACE INTO tags(owner_id,chat_id,tag) VALUES(?,?,?)",(owner_id,m.chat.id,tag_name)); db.commit()
-            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Автоматично присвоєно мітку",tag_name)
-
-    # Автоматичний переклад тексту через OpenAI
-    if content and get_setting(owner_id, "autotranslate_enabled") and allowed_now(owner_id, m.chat.id):
-        lang = get_setting_value(owner_id, "autotranslate_lang") or "uk"
-        try:
-            translated = await openai_text(f"Translate this message into {lang}. Return only the translation:\n\n{content}")
-            await bot.send_message(owner_chat, contact_card(owner_id, m.chat.id, "Автоматичний переклад") + "\n\n" + html.escape(translated[:3000]))
-        except Exception as e:
-            logging.warning("Auto-translate failed: %s", e)
-
-    # Антиспам: повтори однакового тексту від одного контакту за короткий час
-    if content and get_setting(owner_id, "antispam_enabled"):
-        key=(owner_id,m.chat.id); now=time.time(); q=SPAM_RECENT[key]
-        while q and now-q[0][0]>60: q.popleft()
-        q.append((now,content.strip().lower()))
-        duplicates=sum(1 for _,value in q if value==content.strip().lower())
-        if duplicates>=3:
-            await notify_contact(bot,owner_chat,owner_id,m.chat.id,"Виявлено повторюваний спам",f"Однаковий текст повторено {duplicates} рази за хвилину")
-            try: await bot.delete_business_messages(m.business_connection_id,[m.message_id])
-            except Exception: pass
-            return
-
-    # Антифлуд: ліміт повідомлень за хвилину; тільки повідомлення від контакту
-    flood_limit = int(get_setting_value(owner_id, "antiflood_limit") or 0)
-    if flood_limit:
-        key = (owner_id, m.chat.id)
-        now = time.time()
-        q = FLOOD_WINDOWS[key]
-        while q and now - q[0] > 60: q.popleft()
-        q.append(now)
-        if len(q) > flood_limit:
-            await notify_contact(bot, owner_chat, owner_id, m.chat.id, "Виявлено флуд", f"{len(q)} повідомлень за хвилину")
-            try: await bot.delete_business_messages(m.business_connection_id,[m.message_id])
-            except Exception: pass
-            return
-
-    if content and allowed_now(owner_id, m.chat.id):
-        words = db.execute("SELECT word FROM keywords WHERE owner_id=?", (owner_id,)).fetchall()
-        low = content.lower()
-        for (w,) in words:
-            if w.lower() not in low:
-                continue
-            scopes = db.execute(
-                "SELECT chat_id, mode FROM keyword_scope WHERE owner_id=? AND word=?",
-                (owner_id, w),
-            ).fetchall()
-            only_chats = {cid for cid, mode in scopes if mode == "only"}
-            excluded_chats = {cid for cid, mode in scopes if mode == "exclude"}
-            if only_chats and m.chat.id not in only_chats:
-                continue
-            if m.chat.id in excluded_chats:
-                continue
-            await bot.send_message(
-                owner_chat,
-                contact_card(owner_id, m.chat.id, "Знайдено ключове слово", w) + "\n\n"
-                f"🔑 <b>Повідомлення:</b>\n{html.escape(content)}",
-            )
-            break
-
-    if get_setting(owner_id, "autoreply_enabled") and not in_dnd(owner_id):
-        start = get_setting_value(owner_id, "autoreply_start") or ""
-        end = get_setting_value(owner_id, "autoreply_end") or ""
-        if in_time_window(start, end):
-            today = datetime.now().strftime("%Y-%m-%d")
-            sent = db.execute(
-                "SELECT 1 FROM autoreply_sent WHERE owner_id=? AND chat_id=? AND date=?",
-                (owner_id, m.chat.id, today),
-            ).fetchone()
-            if not sent:
-                contact_row = db.execute(
-                    "SELECT text FROM autoreply_contacts WHERE owner_id=? AND chat_id=?",
-                    (owner_id, m.chat.id),
-                ).fetchone()
-                autoreply_text = contact_row[0] if contact_row else (
-                    get_setting_value(owner_id, "autoreply_text") or ""
-                )
-                if autoreply_text:
-                    try:
-                        await bot.send_message(
-                            m.chat.id, autoreply_text, business_connection_id=m.business_connection_id
-                        )
-                        db.execute(
-                            "INSERT OR IGNORE INTO autoreply_sent VALUES(?,?,?)",
-                            (owner_id, m.chat.id, today),
-                        )
-                        db.commit()
-                    except Exception as e:
-                        logging.warning("Автовідповідь не надіслана: %s", e)
 
     cache_message(m)
 
@@ -2521,6 +2303,20 @@ async def scheduler_loop(bot: Bot):
                             (owner_id, "weekly_report", today),
                         )
             db.commit()
+            # Compact SQLite after cleanup; this releases pages from deleted history.
+            # Run once per day, and only after all write transactions are committed.
+            last_vacuum = db.execute(
+                "SELECT last_date FROM daily_tasks WHERE owner_id=0 AND task='db_vacuum'"
+            ).fetchone()
+            if not last_vacuum or last_vacuum[0] != today:
+                db.execute("PRAGMA optimize")
+                db.commit()
+                db.execute("VACUUM")
+                db.execute(
+                    "INSERT OR REPLACE INTO daily_tasks VALUES(?,?,?)",
+                    (0, "db_vacuum", today),
+                )
+                db.commit()
         except Exception as e:
             logging.warning("Помилка планувальника: %s", e)
 
@@ -2562,6 +2358,254 @@ async def cmd_history(m: Message):
         await m.answer("🕘 <b>Останні збережені версії</b>\n\n"+("\n".join(lines) if lines else "Історія порожня.")+"\n\nДля всіх версій: /history CHAT_ID MESSAGE_ID"); return
     lines=[f"<b>Версія {i}</b> · {datetime.fromtimestamp(ts).strftime('%d.%m %H:%M:%S')}\n<blockquote>{html.escape(txt or '[медіа]')}</blockquote>" for i,(txt,ts) in enumerate(rows,1)]
     await m.answer("🕘 <b>Історія редагувань</b>\n\n"+("\n\n".join(lines) if lines else "Версій не знайдено."))
+
+# ---------------------- МОДЕРАЦІЯ TELEGRAM-ГРУП ----------------------
+def is_group_chat(m: Message) -> bool:
+    return bool(m.chat and m.chat.type in ("group", "supergroup"))
+
+
+async def require_group_admin(m: Message, bot: Bot) -> bool:
+    if not is_group_chat(m):
+        await m.answer("Ця команда працює лише в групах і супергрупах.")
+        return False
+    try:
+        member = await bot.get_chat_member(m.chat.id, m.from_user.id)
+        if member.status not in ("creator", "administrator"):
+            await m.answer("⛔ Команда доступна лише адміністраторам групи.")
+            return False
+        me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
+        if me.status != "administrator":
+            await m.answer("Спочатку додай бота в адміністратори групи.")
+            return False
+    except Exception as e:
+        await m.answer("Не вдалося перевірити права адміністратора: " + html.escape(str(e)[:250]))
+        return False
+    return True
+
+
+def replied_user(m: Message):
+    return m.reply_to_message.from_user if m.reply_to_message else None
+
+
+@router.message(Command("help"))
+async def group_help(m: Message):
+    await m.answer(
+        "👥 <b>Керування групою</b>\\n\\n"
+        "Використовуй команди у відповідь на повідомлення учасника:\\n"
+        "<code>/ban</code> — заблокувати; <code>/kick</code> — видалити; "
+        "<code>/mute 10хв</code> — тимчасово обмежити; <code>/unmute</code> — зняти обмеження.\\n"
+        "<code>/unban USER_ID</code> — розблокувати за ID.\\n"
+        "<code>/purge 20</code> — видалити до 20 повідомлень від вибраного повідомлення назад.\\n"
+        "<code>/pin</code> та <code>/unpin</code> — керувати закріпленням.\\n"
+        "<code>/info</code> — перевірити групу та права бота.\\n"
+        "<code>/admins</code> — список адміністраторів.\\n"
+        "<code>/title НАЗВА</code> — змінити назву групи.\\n"
+        "<code>/description ТЕКСТ</code> — змінити опис групи.\\n\\n"
+        "Бот повинен бути адміністратором із дозволом блокувати/обмежувати учасників, видаляти та закріплювати повідомлення."
+    )
+
+
+@router.message(Command("info"))
+async def group_info(m: Message, bot: Bot):
+    if not is_group_chat(m):
+        await m.answer("Команда доступна лише в групі.")
+        return
+    try:
+        me = await bot.get_chat_member(m.chat.id, (await bot.me()).id)
+        await m.answer(
+            f"👥 <b>{html.escape(m.chat.title or 'Група')}</b>\\n"
+            f"Chat ID: <code>{m.chat.id}</code>\\n"
+            f"Статус бота: <b>{html.escape(me.status)}</b>\\n"
+            f"Бот може керувати учасниками: <b>{'так' if getattr(me, 'can_restrict_members', False) else 'ні'}</b>\\n"
+            f"Бот може видаляти повідомлення: <b>{'так' if getattr(me, 'can_delete_messages', False) else 'ні'}</b>\\n"
+            f"Бот може закріплювати: <b>{'так' if getattr(me, 'can_pin_messages', False) else 'ні'}</b>"
+        )
+    except Exception as e:
+        await m.answer("Не вдалося отримати інформацію: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("admins"))
+async def group_admins(m: Message, bot: Bot):
+    if not is_group_chat(m):
+        await m.answer("Команда доступна лише в групі.")
+        return
+    try:
+        admins = await bot.get_chat_administrators(m.chat.id)
+        lines = [f"• {html.escape(a.user.full_name)}" + (f" (@{html.escape(a.user.username)})" if a.user.username else "") for a in admins]
+        await m.answer("🛡 <b>Адміністратори групи</b>\\n\\n" + "\\n".join(lines))
+    except Exception as e:
+        await m.answer("Не вдалося отримати список: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("title"))
+async def group_title(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await m.answer("Формат: /title Нова назва групи")
+        return
+    try:
+        await bot.set_chat_title(m.chat.id, parts[1].strip()[:128])
+        await m.answer("✅ Назву групи змінено.")
+    except Exception as e:
+        await m.answer("Не вдалося змінити назву: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("description"))
+async def group_description(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Формат: /description Опис групи")
+        return
+    try:
+        await bot.set_chat_description(m.chat.id, parts[1].strip()[:255])
+        await m.answer("✅ Опис групи змінено.")
+    except Exception as e:
+        await m.answer("Не вдалося змінити опис: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("ban"))
+async def group_ban(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    target = replied_user(m)
+    if not target:
+        await m.answer("Відповідай командою /ban на повідомлення учасника.")
+        return
+    if target.id == m.from_user.id or target.id == (await bot.me()).id:
+        await m.answer("Не можна заблокувати себе або самого бота.")
+        return
+    try:
+        await bot.ban_chat_member(m.chat.id, target.id)
+        await m.answer(f"🚫 Учасника {html.escape(target.full_name)} заблоковано.")
+    except Exception as e:
+        await m.answer("Не вдалося заблокувати: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("unban"))
+async def group_unban(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await m.answer("Формат: /unban USER_ID")
+        return
+    try:
+        await bot.unban_chat_member(m.chat.id, int(parts[1]), only_if_banned=True)
+        await m.answer("✅ Блокування знято.")
+    except Exception as e:
+        await m.answer("Не вдалося зняти блокування: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("kick"))
+async def group_kick(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    target = replied_user(m)
+    if not target:
+        await m.answer("Відповідай командою /kick на повідомлення учасника.")
+        return
+    try:
+        await bot.ban_chat_member(m.chat.id, target.id)
+        await bot.unban_chat_member(m.chat.id, target.id, only_if_banned=True)
+        await m.answer(f"👢 Учасника {html.escape(target.full_name)} видалено з групи.")
+    except Exception as e:
+        await m.answer("Не вдалося видалити учасника: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("mute"))
+async def group_mute(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    target = replied_user(m)
+    if not target:
+        await m.answer("Відповідай командою /mute 10хв на повідомлення учасника.")
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    seconds = parse_duration(parts[1]) if len(parts) > 1 else 3600
+    if not seconds or seconds < 60:
+        await m.answer("Вкажи строк, наприклад /mute 30хв (мінімум 1 хв).")
+        return
+    until = datetime.now() + timedelta(seconds=seconds)
+    try:
+        await bot.restrict_chat_member(
+            m.chat.id, target.id,
+            permissions=ChatPermissions(can_send_messages=False, can_send_audios=False,
+                can_send_documents=False, can_send_photos=False, can_send_videos=False,
+                can_send_video_notes=False, can_send_voice_notes=False,
+                can_send_polls=False, can_send_other_messages=False,
+                can_add_web_page_previews=False),
+            until_date=until,
+        )
+        await m.answer(f"🔇 {html.escape(target.full_name)} не зможе писати до {until.strftime('%d.%m %H:%M')}.")
+    except Exception as e:
+        await m.answer("Не вдалося обмежити учасника: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("unmute"))
+async def group_unmute(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    target = replied_user(m)
+    if not target:
+        await m.answer("Відповідай командою /unmute на повідомлення учасника.")
+        return
+    try:
+        chat = await bot.get_chat(m.chat.id)
+        perms = chat.permissions or ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True,
+            can_send_other_messages=True, can_add_web_page_previews=True)
+        await bot.restrict_chat_member(m.chat.id, target.id, permissions=perms)
+        await m.answer(f"🔊 Обмеження для {html.escape(target.full_name)} знято.")
+    except Exception as e:
+        await m.answer("Не вдалося зняти обмеження: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("purge"))
+async def group_purge(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    if not m.reply_to_message:
+        await m.answer("Відповідай командою /purge 20 на повідомлення, з якого почати видалення.")
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+    count = max(1, min(count, 100))
+    start_id = m.reply_to_message.message_id
+    deleted = 0
+    for message_id in range(start_id, start_id + count):
+        try:
+            await bot.delete_message(m.chat.id, message_id)
+            deleted += 1
+        except Exception:
+            pass
+    try: await bot.delete_message(m.chat.id, m.message_id)
+    except Exception: pass
+    await m.answer(f"🧹 Видалено повідомлень: {deleted}.")
+
+
+@router.message(Command("pin"))
+async def group_pin(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    if not m.reply_to_message:
+        await m.answer("Відповідай /pin на повідомлення, яке потрібно закріпити.")
+        return
+    try:
+        await bot.pin_chat_message(m.chat.id, m.reply_to_message.message_id)
+        await m.answer("📌 Повідомлення закріплено.")
+    except Exception as e:
+        await m.answer("Не вдалося закріпити: " + html.escape(str(e)[:250]))
+
+
+@router.message(Command("unpin"))
+async def group_unpin(m: Message, bot: Bot):
+    if not await require_group_admin(m, bot): return
+    try:
+        if m.reply_to_message:
+            await bot.unpin_chat_message(m.chat.id, m.reply_to_message.message_id)
+        else:
+            await bot.unpin_chat_message(m.chat.id)
+        await m.answer("📌 Закріплення знято.")
+    except Exception as e:
+        await m.answer("Не вдалося відкріпити: " + html.escape(str(e)[:250]))
+
 
 @router.message(Command("group"))
 async def cmd_group(m: Message):
